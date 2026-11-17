@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# PyInstaller / сборка
+build/
+dist/
+*.spec
+_internal/
+*.exe
+*.dll
+*.pyd
+
+# результаты работы программы и локальное состояние
+out/
+settings.ini
+ui.ini
+
+# системное
+Thumbs.db
+desktop.ini
+.DS_Store
