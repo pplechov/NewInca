@@ -6,6 +6,13 @@ INCA**, экспорт изображений и количественный п
 
 Собрано и проверено на Windows 11 x64, Python 3.12, PyInstaller 6.22.
 
+## Готовые сборки
+
+Скачать: **[Releases → newINCA 1.0.0 (Windows x64)](https://github.com/pplechov/NewInca/releases/latest)** —
+архив `newINCA-1.0.0-win64.zip` (≈35 МБ): `newINCA.exe`, `newINCA-cli.exe`, `_internal\`,
+`calibration\`, `points\`, `tools\`. Распаковать целиком в любую папку и запустить
+`newINCA.exe`; Python и INCA не нужны.
+
 ## Что лежит в папке
 
 ```
