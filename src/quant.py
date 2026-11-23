@@ -38,8 +38,11 @@ STANDARDS_CSV = "xpp_standards.csv"
 
 
 def app_dir():
-    """folder the program lives in (next to the .exe when frozen)"""
+    """Base directory for user data, including settings and point sidecars."""
     if getattr(sys, "frozen", False):
+        if sys.platform == "darwin":
+            # Keep writable data outside the signed application bundle.
+            return os.path.expanduser("~/newINCA")
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(HERE)
 
@@ -120,7 +123,7 @@ def calibration_root():
             return os.path.abspath(env)
         cands.append(env)
     if getattr(sys, "frozen", False):
-        cands.append(os.path.join(os.path.dirname(sys.executable), "calibration"))
+        cands.append(os.path.join(app_dir(), "calibration"))
     if sys.argv and sys.argv[0]:
         cands.append(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])),
                                   "calibration"))

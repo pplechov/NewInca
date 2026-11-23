@@ -26,6 +26,8 @@ FONT_CANDIDATES = [
     r"C:\Windows\Fonts\segoeui.ttf",
     r"C:\Windows\Fonts\tahoma.ttf",
     r"C:\Windows\Fonts\dejavusans.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
 ]
 
 MARKER_COLOURS = [(255, 40, 40), (30, 160, 255), (40, 200, 90),

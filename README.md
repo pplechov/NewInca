@@ -4,9 +4,13 @@
 INCA**, экспорт изображений и количественный пересчёт спектров в оксиды — без
 установленной INCA.
 
-Собрано и проверено на Windows 11 x64, Python 3.12, PyInstaller 6.22.
+Собрано и проверено на Windows 11 x64 и macOS 26.6.2 (Apple Silicon) с Python 3.12 и PyInstaller 6.22.
 
 ## Готовые сборки
+
+**macOS (Apple Silicon).** [Скачать newINCA.app в ZIP](https://github.com/alyon-a/NewInca/raw/refs/heads/main/macos/newINCA-macOS-arm64.zip).
+Распакуйте архив и откройте `newINCA.app`. Python и шесть профилей калибровки входят в приложение.
+Результаты по умолчанию сохраняются в `~/newINCA/out`.
 
 Скачать: **[Releases → newINCA 1.0.0 (Windows x64)](https://github.com/pplechov/NewInca/releases/latest)** —
 архив `newINCA-1.0.0-win64.zip` (≈35 МБ): `newINCA.exe`, `newINCA-cli.exe`, `_internal\`,
@@ -325,6 +329,17 @@ profiles\msu-cpx-opx-amp-bt\profile.ini         прибор, детектор, 
   формат, и молча испортить проект хуже, чем не уметь его сохранять.
 
 ## Сборка из исходников
+
+На macOS с установленными Python 3.12 и Apple Command Line Tools выполните эти команды в корне репозитория.
+
+```sh
+python3 -m pip install pyinstaller pillow numpy
+./build-macos.sh
+```
+
+Готовое приложение появится в `dist/newINCA.app`.
+
+На Windows выполните команды в командной строке.
 
 ```bat
 python -m pip install pyinstaller pillow numpy
