@@ -13,12 +13,11 @@ Where do the areas come from
     line.  A sidecar file (points.py) is used only when the project has none.
 
 How they are drawn
-    INCA marks an analysed area as a rectangle, so that is what is drawn here:
-    the bounding box of the stored chord, with a minimum size so a single point
-    stays visible.  The chord itself is drawn faintly inside the rectangle so
-    the raster path remains readable.
+    A point is marked with a circle. A rastered acquisition is outlined by
+    a rectangle around the stored chord, with the raster path drawn inside.
 """
 import os
+import math
 from PIL import Image as PILImage, ImageDraw, ImageFont
 
 FONT_CANDIDATES = [
@@ -34,6 +33,7 @@ MARKER_COLOURS = [(255, 40, 40), (30, 160, 255), (40, 200, 90),
                   (255, 170, 0), (200, 60, 220), (0, 210, 210)]
 
 MIN_BOX = 11          # px, smallest drawn area (a single-point analysis)
+POINT_RADIUS = 4      # px, radius of a point marker at the displayed size
 
 
 def _font(size, bold=False):
@@ -74,14 +74,17 @@ def _label_box(draw, ax, ay, label, font, colour):
 
 
 def draw_point_area(draw, x, y, label, font, w=0, h=0, colour=(255, 40, 40)):
-    """A point analysis: a small square (INCA's usual rectangle marker)."""
-    w = w if w and w > 1 else MIN_BOX
-    h = h if h and h > 1 else MIN_BOX
-    x0, y0 = x - w / 2.0, y - h / 2.0
-    draw.rectangle([x0, y0, x0 + w, y0 + h], outline=colour, width=2)
-    draw.line([(x - 3, y), (x + 3, y)], fill=colour, width=1)
-    draw.line([(x, y - 3), (x, y + 3)], fill=colour, width=1)
-    _label_box(draw, x0 + w, y, label, font, colour)
+    """Draw a point marker, or outline an acquisition with explicit dimensions."""
+    if w > 1 or h > 1:
+        half_w = max(w, 1) / 2
+        half_h = max(h, 1) / 2
+        draw.rectangle((x - half_w, y - half_h, x + half_w, y + half_h),
+                       outline=colour, width=2)
+    else:
+        half_w = POINT_RADIUS
+        draw.ellipse((x - half_w, y - half_w, x + half_w, y + half_w),
+                     outline=colour, width=2)
+    _label_box(draw, x + half_w, y, label, font, colour)
 
 
 def draw_line_area(draw, pts, label, font, colour=(255, 40, 40), min_box=MIN_BOX):
@@ -104,8 +107,33 @@ def draw_line_area(draw, pts, label, font, colour=(255, 40, 40), min_box=MIN_BOX
     _label_box(draw, x1 + 1, (y0 + y1) / 2.0, label, font, colour)
 
 
+def scale_bar(width, field_width_um):
+    """Return the bar length in display units and the physical-length label."""
+    target = field_width_um / 3
+    decade = 10 ** math.floor(math.log10(target))
+    length = max(step * decade for step in (1, 2, 5) if step * decade <= target)
+    label = "%g мм" % (length / 1000) if length >= 1000 else "%g мкм" % length
+    return width * length / field_width_um, label
+
+
+def draw_scale_bar(img, field_width_um):
+    """Draw against the displayed raster width (excluding any report legend)."""
+    if not field_width_um or img.width < 80 or img.height < 32:
+        return
+    pixels, label = scale_bar(img.width, field_width_um)
+    pixels = round(pixels)
+    draw = ImageDraw.Draw(img)
+    font = _font(12)
+    y = img.height - 7
+    draw.rectangle((3, y - 20, 13 + max(pixels, _text_size(draw, label, font)[0]), y + 4), fill="black")
+    draw.text((8, y - 19), label, font=font, fill="white")
+    draw.line((8, y, 8 + pixels, y), fill="white", width=2)
+    for x in (8, 8 + pixels):
+        draw.line((x, y - 3, x, y + 2), fill="white")
+
+
 def annotate(grey, size, out_path, title="", points=None, lines=None, legend=None,
-             note=None, scale=1):
+             note=None, scale=1, field_width_um=None):
     """grey: PIL 'L' image.
 
     points: [(x, y, label)] or [(x, y, w, h, label)] in image pixel coordinates
@@ -116,6 +144,7 @@ def annotate(grey, size, out_path, title="", points=None, lines=None, legend=Non
     if scale != 1:
         img = img.resize((int(img.width * scale), int(img.height * scale)),
                          PILImage.LANCZOS)
+    draw_scale_bar(img, field_width_um)
     f_mark = _font(max(12, int(13 * scale)), bold=True)
     f_small = _font(max(11, int(12 * scale)))
     f_title = _font(max(13, int(15 * scale)), bold=True)

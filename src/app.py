@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """app.py -- the Windows GUI of newINCA."""
-import os, sys, threading, traceback, queue, configparser, datetime
+import os, sys, threading, traceback, queue, configparser, datetime, math, json
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -12,6 +12,7 @@ from tkinter import ttk, filedialog, messagebox
 import inca_ipj as I
 import points as ptmod
 import pipeline
+import render
 import analysis
 import quant as Q
 
@@ -37,7 +38,7 @@ def _ui_path():
 
 
 def ui_load():
-    cp = configparser.ConfigParser()
+    cp = configparser.ConfigParser(interpolation=None)
     try:
         cp.read(_ui_path(), encoding="utf-8")
     except Exception:
@@ -72,10 +73,19 @@ class App(tk.Tk):
         self.sidecar = {}
         self.outdir = self._ui.get("ui", "out_dir", fallback=os.path.join(APP_DIR, "out"))
         self.last_dir = self._ui.get("ui", "last_dir", fallback="")
+        try:
+            recent = json.loads(self._ui.get("ui", "recent_projects", fallback="[]"))
+        except ValueError:
+            recent = []
+        self.recent_projects = ([path for path in recent if isinstance(path, str) and path][:10]
+                                if isinstance(recent, list) else [])
         self.current_fov = None
         self.placed = []
         self.lines = []
         self._img_ref = None
+        self._image_source = None
+        self._image_status = ""
+        self._field_width_um = None
         self._scale = 1.0
         self._profiles = []
         self._logq = queue.Queue()
@@ -95,6 +105,11 @@ class App(tk.Tk):
         bar = ttk.Frame(self, padding=(6, 4))
         bar.pack(side=tk.TOP, fill=tk.X)
         ttk.Button(bar, text="Открыть проект…", command=self.open_project).pack(side=tk.LEFT)
+        recent_button = ttk.Menubutton(bar, text="▾", width=2)
+        self.recent_menu = tk.Menu(recent_button, tearoff=False,
+                                   postcommand=self._populate_recent_menu)
+        recent_button.configure(menu=self.recent_menu)
+        recent_button.pack(side=tk.LEFT)
         ttk.Button(bar, text="Папка вывода…", command=self.choose_out).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         self.btn_export = ttk.Button(bar, text="Экспорт изображений и расчёт",
@@ -128,6 +143,7 @@ class App(tk.Tk):
         vp.add(top, weight=3)
         self.canvas = tk.Canvas(top, background="#2b2b2b", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.bind("<Configure>", self._resize_image)
 
         # --- analyses + spectrum + info ---------------------------------
         bottom = ttk.Frame(vp)
@@ -144,6 +160,25 @@ class App(tk.Tk):
 
         rf = ttk.Frame(hp)
         hp.add(rf, weight=1)
+        spectrum_controls = ttk.Frame(rf)
+        spectrum_controls.pack(fill=tk.X)
+        ttk.Label(spectrum_controls, text="Шкала интенсивности").pack(side=tk.LEFT)
+        self.spectrum_scale = ttk.Combobox(
+            spectrum_controls, values=("Логарифмическая", "Линейная"),
+            state="readonly", width=19)
+        self.spectrum_scale.current(0)
+        self.spectrum_scale.pack(side=tk.LEFT, padx=6)
+        self.spectrum_scale.bind("<<ComboboxSelected>>", lambda e: self._redraw_spectrum())
+        peak_controls = ttk.Frame(rf)
+        peak_controls.pack(fill=tk.X)
+        ttk.Label(peak_controls, text="Порог подписей").pack(side=tk.LEFT)
+        self.peak_threshold = tk.DoubleVar(value=6)
+        self.peak_threshold_text = tk.StringVar(value="6 %")
+        ttk.Scale(peak_controls, from_=0, to=100, variable=self.peak_threshold,
+                  command=self._change_peak_threshold, takefocus=True).pack(
+                      side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Label(peak_controls, textvariable=self.peak_threshold_text,
+                  width=6).pack(side=tk.LEFT)
         self.spec_canvas = tk.Canvas(rf, background=SPEC_BG, highlightthickness=0,
                                      height=230)
         self.spec_canvas.pack(fill=tk.BOTH, expand=True)
@@ -267,23 +302,48 @@ class App(tk.Tk):
             self.log("Папка вывода: %s" % d)
 
     # -------------------------------------------------------------- actions
-    def open_project(self):
-        path = filedialog.askopenfilename(title="Открыть проект INCA",
-                                          filetypes=SUPPORTED,
-                                          initialdir=self.last_dir or None)
+    def _populate_recent_menu(self):
+        self.recent_menu.delete(0, tk.END)
+        if not self.recent_projects:
+            self.recent_menu.add_command(label="Недавних проектов нет", state=tk.DISABLED)
+        for path in self.recent_projects:
+            label = "%s — %s" % (os.path.basename(path), os.path.dirname(path))
+            self.recent_menu.add_command(label=label, command=lambda p=path: self.open_project(p))
+
+    def open_project(self, path=None):
+        if path is None:
+            path = filedialog.askopenfilename(title="Открыть проект INCA",
+                                              filetypes=SUPPORTED,
+                                              initialdir=self.last_dir or None)
         if not path:
             return
+        path = os.path.abspath(path)
         try:
             self.proj = I.open_project(path)
         except Exception as e:
             messagebox.showerror("Ошибка", "Не удалось прочитать файл:\n%s" % e)
             return
         self.project_path = path
-        # remember the folder so the next "Открыть" starts there
-        self.last_dir = os.path.dirname(os.path.abspath(path))
+        self.last_dir = os.path.dirname(path)
+        self.recent_projects = ([path] + [other for other in self.recent_projects
+                                          if other != path])[:10]
+        cp = ui_load()
+        if not cp.has_section("ui"):
+            cp.add_section("ui")
+        cp.set("ui", "recent_projects", json.dumps(self.recent_projects, ensure_ascii=False))
+        cp.set("ui", "last_dir", self.last_dir)
+        ui_save(cp)
         self.sidecar = ptmod.load(path, APP_DIR)
         self.records = []
         self.placed, self.lines = [], []
+        self.current_fov = None
+        self._spec = None
+        self._show_image()
+        self.lst.delete(0, tk.END)
+        self.info.configure(state=tk.NORMAL)
+        self.info.delete("1.0", tk.END)
+        self.info.configure(state=tk.DISABLED)
+        self._redraw_spectrum()
         self._std = None
         self._std_key = None
         self._fill_tree()
@@ -369,6 +429,8 @@ class App(tk.Tk):
     def _show_image(self):
         f = self.current_fov
         self.canvas.delete("all")
+        self._img_ref = None
+        self._image_source = None
         if not f:
             return
         if not f.images:
@@ -379,17 +441,30 @@ class App(tk.Tk):
             self.canvas.create_text(20, 20, anchor="nw", fill="white",
                                     text="изображение участка не читается")
             return
-        img = m.to_pil().convert("RGB")
-        cw = max(self.canvas.winfo_width(), 400)
-        ch = max(self.canvas.winfo_height(), 300)
-        self._scale = min(cw / m.width, ch / m.height, 1.0)
-        disp = img.resize((max(1, int(m.width * self._scale)),
-                           max(1, int(m.height * self._scale))))
+        self._image_source = m.to_pil().convert("RGB")
+        self._field_width_um = f.images[0].field_width_um()
+        self._image_status = "%s — %dx%d, %d бит" % (
+            f.name() or f.id, m.width, m.height, m.bits)
+        self._resize_image()
+
+    def _resize_image(self, _event=None):
+        img = self._image_source
+        if img is None:
+            return
+        self._scale = min(self.canvas.winfo_width() / img.width,
+                          self.canvas.winfo_height() / img.height, 1.0)
+        disp = img.resize((max(1, int(img.width * self._scale)),
+                           max(1, int(img.height * self._scale))))
         from PIL import ImageTk
         self._img_ref = ImageTk.PhotoImage(disp)
-        self._redraw_markers()
-        self.status.set("%s — %dx%d, %d бит, масштаб %.2f"
-                        % (f.name() or f.id, m.width, m.height, m.bits, self._scale))
+        selected = self._selected_spectrum()
+        if selected:
+            self._highlight(selected[0])
+        else:
+            self._redraw_markers()
+        field = ("поле съёмки %.4g мкм" % self._field_width_um
+                 if self._field_width_um else "калибровка масштаба недоступна")
+        self.status.set("%s · %s" % (self._image_status, field))
 
     def _redraw_markers(self):
         self.canvas.delete("all")
@@ -414,10 +489,28 @@ class App(tk.Tk):
                                     fill="#ff3030", font=("Arial", 11, "bold"))
         for (x, y, lbl, _sid) in self.placed:
             px, py = x * s, y * s
-            self.canvas.create_rectangle(px - 5.5, py - 5.5, px + 5.5, py + 5.5,
-                                         outline="#ff3030", width=2)
-            self.canvas.create_text(px + 10, py, text=str(lbl), anchor="w",
+            radius = render.POINT_RADIUS
+            self.canvas.create_oval(px - radius, py - radius, px + radius, py + radius,
+                                    outline="#ff3030", width=2)
+            self.canvas.create_text(px + radius + 4, py, text=str(lbl), anchor="w",
                                     fill="#ff3030", font=("Arial", 11, "bold"))
+        self._draw_scale_bar()
+
+    def _draw_scale_bar(self):
+        width, height = self._img_ref.width(), self._img_ref.height()
+        if not self._field_width_um or width < 80 or height < 32:
+            return
+        pixels, text = render.scale_bar(width, self._field_width_um)
+        x, y = 8, height - 7
+        label = self.canvas.create_text(x, y - 5, text=text, anchor="sw",
+                                        fill="white", font=("Arial", 11))
+        _, top, right, _ = self.canvas.bbox(label)
+        plate = self.canvas.create_rectangle(3, top - 2, max(x + pixels, right) + 5,
+                                              y + 4, fill="black", width=0)
+        self.canvas.tag_lower(plate, label)
+        self.canvas.create_line(x, y, x + pixels, y, fill="white", width=2)
+        for end in (x, x + pixels):
+            self.canvas.create_line(end, y - 3, end, y + 2, fill="white")
 
     def _draw_card(self, f):
         state = {"points": "есть", "empty": "нет: ChordList записан пустым",
@@ -471,8 +564,13 @@ class App(tk.Tk):
         for (x, y, lbl, _sid) in self.placed:
             if str(lbl) == str(n):
                 px, py = x * s, y * s
-                self.canvas.create_rectangle(px - 10, py - 10, px + 10, py + 10,
-                                             outline="#ffe14d", width=2)
+                radius = render.POINT_RADIUS + 3
+                self.canvas.create_oval(px - radius, py - radius, px + radius, py + radius,
+                                        outline="#ffe14d", width=2)
+
+    def _change_peak_threshold(self, _value):
+        self.peak_threshold_text.set("%d %%" % round(self.peak_threshold.get()))
+        self._redraw_spectrum()
 
     def _draw_spectrum(self, sp):
         self._spec = (sp.counts(), [l for l in sp.labels() if 0 < l[2] < 21000])
@@ -490,15 +588,24 @@ class App(tk.Tk):
             return
         counts, labels = data
         n = len(counts)
-        if not n:
+        if n < 2:
             return
         L, R, T, B = 52, 14, 20, 30
         x0, x1, y0, y1 = L, w - R, T, h - B
         if x1 - x0 < 40 or y1 - y0 < 30:
             return
         top = max(max(counts), 1)
-        import math
-        ymax = math.log10(top + 1)
+        logarithmic = self.spectrum_scale.current() == 0
+        if logarithmic:
+            ymax = math.log10(top + 1)
+            ticks = [10 ** exp for exp in range(math.floor(math.log10(top)) + 1)]
+        else:
+            target = max(1, top / 5)
+            decade = 10 ** math.floor(math.log10(target))
+            tick_step = next(step * decade for step in (1, 2, 5, 10)
+                             if step * decade >= target)
+            ymax = math.ceil(top / tick_step) * tick_step
+            ticks = range(0, ymax + 1, tick_step)
         e_lo = I.to_energy(0) / 1000.0
         e_hi = I.to_energy(n - 1) / 1000.0
 
@@ -506,16 +613,15 @@ class App(tk.Tk):
             return x0 + (x1 - x0) * (e_kev - e_lo) / (e_hi - e_lo)
 
         def Y(v):
-            return y1 - (y1 - y0) * (math.log10(max(v, 1)) / ymax)
+            value = math.log10(v + 1) if logarithmic else v
+            return y1 - (y1 - y0) * (value / ymax)
 
         # grid
-        dec = 1
-        while dec <= top:
-            y = Y(dec)
+        for tick in ticks:
+            y = Y(tick)
             c.create_line(x0, y, x1, y, fill="#243040")
-            c.create_text(x0 - 6, y, text="%d" % dec, anchor="e",
+            c.create_text(x0 - 6, y, text="%d" % tick, anchor="e",
                           fill=AXIS, font=("Segoe UI", 8))
-            dec *= 10
         e = 0.0
         while e <= e_hi:
             x = X(e)
@@ -542,25 +648,45 @@ class App(tk.Tk):
             ch = a + seg.index(v)
             pts.extend((X(I.to_energy(ch) / 1000.0), Y(v)))
         if len(pts) > 3:
-            c.create_line(*pts, fill="#7fd4ff", width=1)
+            c.create_line(*pts, fill="#7fd4ff", width=1, tags=("spectrum_curve",))
 
-        # main lines: only those that actually rise above the continuum
-        seen = set()
-        for (_idx, name, energy) in sorted(labels, key=lambda t: t[2]):
-            if name in seen:
-                continue
+        # Keep each saved line at its own energy.
+        visible = []
+        threshold = top * round(self.peak_threshold.get()) / 100
+        for _idx, name, energy in labels:
             ch = int(round(energy / I.EV_PER_CH + I.ZERO_CH))
             if ch < 1 or ch >= n:
                 continue
             lo, hi = max(0, ch - 6), min(n, ch + 7)
             v = max(counts[lo:hi])
-            if v < 0.06 * top:
+            if v < threshold:
                 continue
-            seen.add(name)
+            background = (counts[max(0, ch - 12)] + counts[min(n - 1, ch + 12)]) / 2
+            visible.append((v - background, v, energy, name))
+
+        for _, v, energy, name in sorted(visible, reverse=True):
             x = X(energy / 1000.0)
-            c.create_line(x, y0, x, y1, fill="#5a4630")
-            c.create_text(x, Y(v) - 8, text=name, fill="#ffcf70",
-                          font=("Segoe UI", 9, "bold"))
+            label_y = max(y0 + 8, Y(v) - 8)
+            label_y = min(y1 - 8, label_y)
+            marker = c.create_line(x, y0, x, y1, fill="#5a4630")
+            c.tag_lower(marker, "spectrum_curve")
+            label = c.create_text(x, label_y, text=name, fill="#ffcf70",
+                                  font=("Segoe UI", 9, "bold"))
+            left, _, right, _ = c.bbox(label)
+            c.move(label, max(0, x0 - left) - max(0, right - x1), 0)
+            # Try the rows nearest the peak until the text clears nearby labels.
+            left, upper, right, lower = c.bbox(label)
+            row_height = lower - upper + 2
+            rows_above = range(0, math.floor(max(0, upper - y0) / row_height) + 1)
+            rows_below = range(1, math.floor(max(0, y1 - lower) / row_height) + 1)
+            offsets = [-row * row_height for row in rows_above]
+            offsets.extend(row * row_height for row in rows_below)
+            for offset in offsets:
+                nearby = c.find_overlapping(left, upper + offset, right, lower + offset)
+                if all("peak_label" not in c.gettags(item) for item in nearby):
+                    c.move(label, 0, offset)
+                    break
+            c.addtag_withtag("peak_label", label)
 
         c.create_text(x0, 6, anchor="w", text="%d каналов" % n, fill=AXIS,
                       font=("Segoe UI", 8))
@@ -587,6 +713,10 @@ class App(tk.Tk):
         lines.append("Всего импульсов: %d   максимум: %d   элементы: %s"
                      % (sum(counts), max(counts) if counts else 0,
                         ", ".join(els) or "—"))
+        labels = sp.labels()
+        if labels:
+            lines.append("Метки INCA: " + ", ".join("%s %.3f кэВ" % (name, ev / 1000)
+                                                   for _, name, ev in labels))
         if analysis.is_failed(counts):
             lines.append("Расчёт: неудачная съёмка (нет пиков выше нуль-пика)")
         else:
