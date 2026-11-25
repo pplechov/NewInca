@@ -21,12 +21,19 @@ import math
 from PIL import Image as PILImage, ImageDraw, ImageFont
 
 FONT_CANDIDATES = [
+    # Windows
     r"C:\Windows\Fonts\arial.ttf",
     r"C:\Windows\Fonts\segoeui.ttf",
     r"C:\Windows\Fonts\tahoma.ttf",
     r"C:\Windows\Fonts\dejavusans.ttf",
+    # macOS (the .ttc is a collection: PIL opens its first face)
     "/System/Library/Fonts/Supplemental/Arial.ttf",
     "/System/Library/Fonts/Helvetica.ttc",
+    "/System/Library/Fonts/Supplemental/DejaVuSans.ttf",
+    # Linux
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
 ]
 
 MARKER_COLOURS = [(255, 40, 40), (30, 160, 255), (40, 200, 90),
@@ -108,8 +115,16 @@ def draw_line_area(draw, pts, label, font, colour=(255, 40, 40), min_box=MIN_BOX
 
 
 def scale_bar(width, field_width_um):
-    """Return the bar length in display units and the physical-length label."""
-    target = field_width_um / 3
+    """Return the bar length in display units and the physical-length label.
+
+    None when the field width is unknown or shorter than one micrometre, so a
+    rare or malformed acquisition record cannot break the export.
+    """
+    if not field_width_um or field_width_um <= 0:
+        return None
+    target = field_width_um / 3.0
+    if target < 1:
+        return None
     decade = 10 ** math.floor(math.log10(target))
     length = max(step * decade for step in (1, 2, 5) if step * decade <= target)
     label = "%g мм" % (length / 1000) if length >= 1000 else "%g мкм" % length
@@ -120,7 +135,10 @@ def draw_scale_bar(img, field_width_um):
     """Draw against the displayed raster width (excluding any report legend)."""
     if not field_width_um or img.width < 80 or img.height < 32:
         return
-    pixels, label = scale_bar(img.width, field_width_um)
+    bar = scale_bar(img.width, field_width_um)
+    if bar is None:
+        return
+    pixels, label = bar
     pixels = round(pixels)
     draw = ImageDraw.Draw(img)
     font = _font(12)

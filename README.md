@@ -4,18 +4,40 @@
 INCA**, экспорт изображений и количественный пересчёт спектров в оксиды — без
 установленной INCA.
 
-Собрано и проверено на Windows 11 x64 и macOS 26.6.2 (Apple Silicon) с Python 3.12 и PyInstaller 6.22.
+Собрано и проверено на Windows 11 x64 и macOS 26 (Apple Silicon) с Python 3.12
+и PyInstaller 6.22. Один и тот же исходный код собирается под обе системы.
 
 ## Готовые сборки
 
-**macOS (Apple Silicon).** [Скачать newINCA.app в ZIP](https://github.com/alyon-a/NewInca/raw/refs/heads/main/macos/newINCA-macOS-arm64.zip).
-Распакуйте архив и откройте `newINCA.app`. Python и шесть профилей калибровки входят в приложение.
-Результаты по умолчанию сохраняются в `~/newINCA/out`.
+Обе сборки лежат в **[Releases](../../releases/latest)** — в репозитории только
+исходники.
 
-Скачать: **[Releases → newINCA 1.0.0 (Windows x64)](https://github.com/pplechov/NewInca/releases/latest)** —
-архив `newINCA-1.0.0-win64.zip` (≈35 МБ): `newINCA.exe`, `newINCA-cli.exe`, `_internal\`,
-`calibration\`, `points\`, `tools\`. Распаковать целиком в любую папку и запустить
-`newINCA.exe`; Python и INCA не нужны.
+**Windows x64.** `newINCA-<версия>-win64.zip` (≈35 МБ): `newINCA.exe`,
+`newINCA-cli.exe`, `_internal\`, `calibration\`, `points\`, `tools\`.
+Распаковать целиком в любую папку и запустить `newINCA.exe`; Python и INCA не
+нужны.
+
+**macOS (Apple Silicon).** `newINCA-<версия>-macOS-arm64.zip` — внутри
+`newINCA.app` с Python и всеми профилями калибровки. Приложение не подписано
+сертификатом Apple, поэтому при первом запуске: правый щелчок по `newINCA.app`
+→ «Открыть», либо в терминале
+
+```sh
+xattr -dr com.apple.quarantine newINCA.app
+```
+
+## Где программа хранит данные
+
+| | Windows | macOS / Linux |
+|---|---|---|
+| программа | папка, куда распакован архив | `.app` (только чтение) |
+| `settings.ini`, `ui.ini` | рядом с `.exe` | `~/Library/Application Support/newINCA` · `~/.local/share/newINCA` |
+| результаты, `points.csv` | `out\` рядом с `.exe` | та же папка данных, `out/` |
+| калибровка | `calibration\` рядом с `.exe` — можно править | внутрь бандла не пишем: своя калибровка кладётся в папку данных |
+
+Своя папка данных задаётся переменной `NEWINCA_HOME`, калибровка —
+`NEWINCA_CALIB` (она важнее встроенной). Первая Mac-сборка держала данные в
+`~/newINCA` — эта папка подхватывается автоматически, если существует.
 
 ## Что лежит в папке
 
@@ -43,6 +65,10 @@ newINCA\
 ├─ out\                   результаты по умолчанию
 └─ src\                   исходный код
 ```
+
+Внутри `newINCA.app` то же самое: `Contents/MacOS/newINCA` — та же программа,
+`calibration`, `points` и `tools` — в `Contents/Frameworks`. Терминальный
+режим на macOS: `newINCA.app/Contents/MacOS/newINCA list <проект.ipj>`.
 
 ## Быстрый старт
 
@@ -88,7 +114,8 @@ newINCA\
 открытых проектов. Список сохраняется между запусками.
 
 Программа помнит последнюю папку проекта, папку вывода, размер и положение
-окна (в `%APPDATA%\newINCA\ui.ini`), поэтому следующее «Открыть проект…»
+окна (в `ui.ini` рядом с программой: на Windows — папка `.exe`, на macOS —
+`~/Library/Application Support/newINCA`), поэтому следующее «Открыть проект…»
 начинается с той же папки.
 
 ## Разные версии проектов и разные приборы
@@ -335,25 +362,26 @@ profiles\msu-cpx-opx-amp-bt\profile.ini         прибор, детектор, 
 
 ## Сборка из исходников
 
-На macOS с установленными Python 3.12 и Apple Command Line Tools выполните эти команды в корне репозитория.
+Нужны Python 3.12 и пакеты `pyinstaller`, `pillow`, `numpy`; на macOS ещё
+Apple Command Line Tools (Tk). Из корня репозитория:
 
 ```sh
-python3 -m pip install pyinstaller pillow numpy
-./build-macos.sh
-```
-
-Готовое приложение появится в `dist/newINCA.app`.
-
-На Windows выполните команды в командной строке.
-
-```bat
 python -m pip install pyinstaller pillow numpy
-cd src
-python -m PyInstaller --onedir --noconsole --name newINCA_gui main.py
-python -m PyInstaller --onedir --console  --name newINCA_cli main.py
+python build.py            # собрать в dist/ и упаковать zip
+python build.py --no-zip   # только собрать
+python build.py --clean    # удалить build/ и dist/
 ```
 
-Затем переименовать `newINCA_gui.exe` → `newINCA.exe`, `newINCA_cli.exe` →
-`newINCA-cli.exe` и положить рядом общий `_internal` и папки `calibration`,
-`points`, `tools`. Оба .exe собираются из одного `main.py`, поэтому набор
-библиотек в `_internal` у них одинаковый.
+`build.py` сам определяет систему:
+
+| система | что получится |
+|---|---|
+| Windows | `dist\newINCA-win64\`: `newINCA.exe` (GUI), `newINCA-cli.exe`, общий `_internal`, `calibration`, `points`, `tools`; архив `dist\newINCA-<версия>-win64.zip` |
+| macOS | `dist/newINCA.app` (GUI, калибровка внутри) и `dist/newINCA-<версия>-macOS-arm64.zip`, собранный `ditto`, чтобы бандл не потерял символические ссылки |
+| Linux | `dist/newINCA-linux-<arch>/`: один исполняемый файл `newINCA` — и GUI, и командная строка |
+
+Версия лежит в `src/version.py` и попадает в имена архивов и в `--version`.
+
+Сборки также делает GitHub Actions (`.github/workflows/build.yml`) на
+`windows-latest` и `macos-14`: пуш в `main` кладёт архивы в артефакты, тег
+`v*` — в Releases.

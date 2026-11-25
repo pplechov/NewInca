@@ -37,14 +37,55 @@ SETTINGS_INI = "settings.ini"
 STANDARDS_CSV = "xpp_standards.csv"
 
 
-def app_dir():
-    """Base directory for user data, including settings and point sidecars."""
+APP_NAME = "newINCA"
+
+
+def bundle_dir():
+    """Read-only root of the shipped program.
+
+    Windows: the folder holding the .exe and _internal (PyInstaller sets
+    sys._MEIPASS to _internal).  macOS: Contents/Frameworks inside the .app.
+    Running from source: the repository root.
+    """
     if getattr(sys, "frozen", False):
-        if sys.platform == "darwin":
-            # Keep writable data outside the signed application bundle.
-            return os.path.expanduser("~/newINCA")
-        return os.path.dirname(os.path.abspath(sys.executable))
+        return getattr(sys, "_MEIPASS",
+                       os.path.dirname(os.path.abspath(sys.executable)))
     return os.path.dirname(HERE)
+
+
+def _user_data_root():
+    """Per-user writable folder for settings, sidecars and results."""
+    env = os.environ.get("NEWINCA_HOME")
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    if sys.platform == "darwin":
+        # the first macOS build kept its data in ~/newINCA -- do not move it
+        legacy = os.path.expanduser(os.path.join("~", APP_NAME))
+        if os.path.isdir(legacy):
+            return legacy
+        return os.path.expanduser(os.path.join("~", "Library",
+                                               "Application Support", APP_NAME))
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, APP_NAME)
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser(
+        os.path.join("~", ".local", "share"))
+    return os.path.join(base, APP_NAME)
+
+
+def app_dir():
+    """Writable folder for settings.ini, point sidecars and the default output.
+
+    Windows keeps the portable layout (next to the .exe, as in the 1.0.0
+    release); an .app bundle on macOS and an installed program on Linux must
+    not write inside themselves, so they use the per-user folder instead.
+    Running from source, it is the repository root.
+    """
+    if not getattr(sys, "frozen", False):
+        return os.path.dirname(HERE)
+    if os.name == "nt":
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return _user_data_root()
 
 
 # --------------------------------------------------------------------------- #
@@ -123,7 +164,14 @@ def calibration_root():
             return os.path.abspath(env)
         cands.append(env)
     if getattr(sys, "frozen", False):
+        # a calibration the user keeps beside the data folder or the program wins
+        # over the bundled one: instrument data must be replaceable without a
+        # rebuild (on Windows app_dir() is the .exe folder itself)
         cands.append(os.path.join(app_dir(), "calibration"))
+        if bundle_dir() != app_dir():
+            cands.append(os.path.join(bundle_dir(), "calibration"))
+        cands.append(os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
+                                  "calibration"))
     if sys.argv and sys.argv[0]:
         cands.append(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])),
                                   "calibration"))

@@ -16,6 +16,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+from version import __version__
+
 CLI_COMMANDS = {"list", "info", "profiles", "export", "quant", "selftest"}
 
 
@@ -50,6 +52,10 @@ def main():
     if args and args[0] in ("-h", "--help", "/?"):
         _safe_streams()
         print(__doc__)
+        return 0
+    if args and args[0] in ("-V", "--version"):
+        _safe_streams()
+        print("newINCA %s" % __version__)
         return 0
     import app
     app.run()

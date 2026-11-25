@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""app.py -- the Windows GUI of newINCA."""
+"""app.py -- the graphical interface of newINCA (one Tk window per platform)."""
 import os, sys, threading, traceback, queue, configparser, datetime, math, json
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -16,9 +16,14 @@ import render
 import analysis
 import quant as Q
 
-APP_DIR = Q.app_dir()          # the folder the program (or its .exe) lives in
+APP_DIR = Q.app_dir()          # writable data folder: settings, sidecars, out
 APP_TITLE = "newINCA — просмотр и экспорт проектов INCA"
 SUPPORTED = [("Проекты INCA", "*.ipj *.ipl *.IPJ *.IPL"), ("Все файлы", "*.*")]
+
+# Tk substitutes a default when the family is missing, so one name per platform
+# is enough; the label size stays the same on every OS.
+UI_FONT = {"win32": "Segoe UI", "darwin": "Helvetica Neue"}.get(sys.platform,
+                                                               "DejaVu Sans")
 
 SPEC_BG = "#101418"
 AXIS = "#8899aa"
@@ -28,12 +33,11 @@ AXIS = "#8899aa"
 #  UI settings: the last folders are remembered between runs
 # --------------------------------------------------------------------------- #
 def _ui_path():
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    d = os.path.join(base, "newINCA")
+    d = APP_DIR
     try:
         os.makedirs(d, exist_ok=True)
     except Exception:
-        d = APP_DIR
+        d = os.path.dirname(os.path.abspath(__file__)) or "."
     return os.path.join(d, "ui.ini")
 
 
@@ -500,7 +504,10 @@ class App(tk.Tk):
         width, height = self._img_ref.width(), self._img_ref.height()
         if not self._field_width_um or width < 80 or height < 32:
             return
-        pixels, text = render.scale_bar(width, self._field_width_um)
+        bar = render.scale_bar(width, self._field_width_um)
+        if bar is None:
+            return
+        pixels, text = bar
         x, y = 8, height - 7
         label = self.canvas.create_text(x, y - 5, text=text, anchor="sw",
                                         fill="white", font=("Arial", 11))
@@ -523,7 +530,7 @@ class App(tk.Tk):
         for i, txt in enumerate(lines):
             self.canvas.create_text(24, y, anchor="nw",
                                     fill=("#ffffff" if i < 2 else "#c8c8c8"),
-                                    text=txt, font=("Segoe UI", 12,
+                                    text=txt, font=(UI_FONT, 12,
                                                     "bold" if i < 2 else "normal"))
             y += 22
         self.status.set("%s — изображения в проекте нет" % (f.name() or f.id))
@@ -621,18 +628,18 @@ class App(tk.Tk):
             y = Y(tick)
             c.create_line(x0, y, x1, y, fill="#243040")
             c.create_text(x0 - 6, y, text="%d" % tick, anchor="e",
-                          fill=AXIS, font=("Segoe UI", 8))
+                          fill=AXIS, font=(UI_FONT, 8))
         e = 0.0
         while e <= e_hi:
             x = X(e)
             if x >= x0:
                 c.create_line(x, y0, x, y1, fill="#1b2430")
                 c.create_text(x, y1 + 10, text="%g" % e, fill=AXIS,
-                              font=("Segoe UI", 8))
+                              font=(UI_FONT, 8))
             e += 1.0
         c.create_rectangle(x0, y0, x1, y1, outline="#3a4a5e")
         c.create_text(x1, y1 + 22, text="кэВ", anchor="e", fill=AXIS,
-                      font=("Segoe UI", 8))
+                      font=(UI_FONT, 8))
 
         # spectrum: one value per pixel column (the maximum, so peaks survive)
         cols = max(1, int(x1 - x0))
@@ -671,7 +678,7 @@ class App(tk.Tk):
             marker = c.create_line(x, y0, x, y1, fill="#5a4630")
             c.tag_lower(marker, "spectrum_curve")
             label = c.create_text(x, label_y, text=name, fill="#ffcf70",
-                                  font=("Segoe UI", 9, "bold"))
+                                  font=(UI_FONT, 9, "bold"))
             left, _, right, _ = c.bbox(label)
             c.move(label, max(0, x0 - left) - max(0, right - x1), 0)
             # Try the rows nearest the peak until the text clears nearby labels.
@@ -689,7 +696,7 @@ class App(tk.Tk):
             c.addtag_withtag("peak_label", label)
 
         c.create_text(x0, 6, anchor="w", text="%d каналов" % n, fill=AXIS,
-                      font=("Segoe UI", 8))
+                      font=(UI_FONT, 8))
 
     def _show_info(self, n, sp):
         em = sp.em_conditions()

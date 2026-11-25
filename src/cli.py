@@ -7,14 +7,22 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 
+def prog():
+    """The name the user actually types: newINCA.exe, newINCA, or main.py."""
+    if getattr(sys, "frozen", False):
+        return os.path.basename(sys.executable)
+    return "newINCA"
+
+
 def usage():
+    p = prog()
     return ("использование:\n"
-            "  newINCA.exe list     <проект.ipj>\n"
-            "  newINCA.exe info     <проект.ipj> [--json]\n"
-            "  newINCA.exe export   <проект.ipj> [папка] [--profile ИМЯ]\n"
-            "  newINCA.exe quant    <проект.ipj> [папка] [--profile ИМЯ]\n"
-            "  newINCA.exe profiles\n"
-            "  newINCA.exe selftest <файл.ipj | папка> ...\n")
+            "  %s list     <проект.ipj>\n"
+            "  %s info     <проект.ipj> [--json]\n"
+            "  %s export   <проект.ipj> [папка] [--profile ИМЯ]\n"
+            "  %s quant    <проект.ipj> [папка] [--profile ИМЯ]\n"
+            "  %s profiles\n"
+            "  %s selftest <файл.ipj | папка> ...\n" % ((p,) * 6))
 
 
 def _parse(argv):
