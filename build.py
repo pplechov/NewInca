@@ -156,6 +156,24 @@ def package(target, kind):
     return out
 
 
+def refresh_in_place(target):
+    """Put the fresh Windows build where the old portable newINCA.exe lived.
+
+    The 1.0.0 release kept the program in the repository root; this keeps that
+    shortcut pointing at the current code instead of an exe from November.
+    """
+    if os.name != "nt":
+        raise SystemExit("--in-place имеет смысл только для переносимой сборки Windows")
+    for name in ("newINCA.exe", "newINCA-cli.exe"):
+        shutil.copy2(os.path.join(target, name), os.path.join(ROOT, name))
+        log("обновлён %s" % name)
+    dst = os.path.join(ROOT, "_internal")
+    if os.path.isdir(dst):
+        shutil.rmtree(dst)
+    shutil.copytree(os.path.join(target, "_internal"), dst)
+    log("обновлён _internal")
+
+
 def main(argv):
     if "--clean" in argv:
         for d in (BUILD, DIST):
@@ -175,6 +193,8 @@ def main(argv):
         target, kind = assemble_linux(), "dir"
 
     log("готово: %s" % target)
+    if "--in-place" in argv:
+        refresh_in_place(target)
     if "--no-zip" not in argv:
         package(target, kind)
     return 0

@@ -367,9 +367,10 @@ Apple Command Line Tools (Tk). Из корня репозитория:
 
 ```sh
 python -m pip install pyinstaller pillow numpy
-python build.py            # собрать в dist/ и упаковать zip
-python build.py --no-zip   # только собрать
-python build.py --clean    # удалить build/ и dist/
+python build.py                # собрать в dist/ и упаковать zip
+python build.py --no-zip       # только собрать
+python build.py --in-place     # Windows: ещё и обновить newINCA.exe в корне
+python build.py --clean        # удалить build/ и dist/
 ```
 
 `build.py` сам определяет систему:
@@ -380,8 +381,13 @@ python build.py --clean    # удалить build/ и dist/
 | macOS | `dist/newINCA.app` (GUI, калибровка внутри) и `dist/newINCA-<версия>-macOS-arm64.zip`, собранный `ditto`, чтобы бандл не потерял символические ссылки |
 | Linux | `dist/newINCA-linux-<arch>/`: один исполняемый файл `newINCA` — и GUI, и командная строка |
 
+Флаг `--in-place` нужен из-за переносимой сборки, которая лежит прямо в корне
+репозитория: без него `newINCA.exe` в корне остаётся прежним, и запускается
+старый интерфейс. После правок в `src\` собирайте с этим флагом (или
+запускайте `dist\newINCA-win64\newINCA.exe`).
+
 Версия лежит в `src/version.py` и попадает в имена архивов и в `--version`.
 
 Сборки также делает GitHub Actions (`.github/workflows/build.yml`) на
-`windows-latest` и `macos-14`: пуш в `main` кладёт архивы в артефакты, тег
+`windows-latest` и `macos-15`: пуш в `main` кладёт архивы в артефакты, тег
 `v*` — в Releases.
