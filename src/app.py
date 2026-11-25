@@ -92,17 +92,24 @@ class App(tk.Tk):
         self._field_width_um = None
         self._scale = 1.0
         self._profiles = []
+        self._mac_sets = []
         self._logq = queue.Queue()
         self._std = None
         self._std_key = None
         self._export_finished = False
+        # spectrum view: (energy_lo, energy_hi) in keV, None = whole spectrum
+        self._view = None
+        self._spec_range = None
+        self._drag = None
 
         self._build_ui()
         self._refresh_profiles()
+        self._refresh_mac_sets()
         self.after(120, self._drain_log)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.log("Готово. Откройте файл .ipj (или .ipl) через «Открыть проект…».")
         self.log("Калибровка: %s" % Q.active_profile().title)
+        self.log("Коэффициенты поглощения: %s" % Q.mac_title())
 
     # ------------------------------------------------------------------ ui
     def _build_ui(self):
@@ -121,10 +128,18 @@ class App(tk.Tk):
         self.btn_export.pack(side=tk.LEFT)
 
         ttk.Button(bar, text="?", width=3, command=self.show_calibration).pack(side=tk.RIGHT)
-        self.profile_box = ttk.Combobox(bar, state="readonly", width=38)
+        self.profile_box = ttk.Combobox(bar, state="readonly", width=30)
         self.profile_box.pack(side=tk.RIGHT)
         self.profile_box.bind("<<ComboboxSelected>>", self.on_profile_change)
         ttk.Label(bar, text="Калибровка:").pack(side=tk.RIGHT, padx=(12, 4))
+
+        self.absorb_var = tk.BooleanVar(value=Q.absorption_enabled())
+        ttk.Checkbutton(bar, text="поправка", variable=self.absorb_var,
+                        command=self.on_absorption_change).pack(side=tk.RIGHT, padx=(0, 4))
+        self.mac_box = ttk.Combobox(bar, state="readonly", width=22)
+        self.mac_box.pack(side=tk.RIGHT)
+        self.mac_box.bind("<<ComboboxSelected>>", self.on_mac_change)
+        ttk.Label(bar, text="μ/ρ:").pack(side=tk.RIGHT, padx=(12, 4))
 
         pw = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         pw.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
@@ -184,9 +199,24 @@ class App(tk.Tk):
         ttk.Label(peak_controls, textvariable=self.peak_threshold_text,
                   width=6).pack(side=tk.LEFT)
         self.spec_canvas = tk.Canvas(rf, background=SPEC_BG, highlightthickness=0,
-                                     height=230)
+                                     height=230, takefocus=True)
         self.spec_canvas.pack(fill=tk.BOTH, expand=True)
         self.spec_canvas.bind("<Configure>", lambda e: self._redraw_spectrum())
+        # zoom / pan: keys +-, arrows, mouse wheel and dragging
+        self.spec_canvas.bind("<Button-1>", self._spec_press)
+        self.spec_canvas.bind("<B1-Motion>", self._spec_drag)
+        self.spec_canvas.bind("<ButtonRelease-1>", self._spec_release)
+        self.spec_canvas.bind("<Double-Button-1>", lambda e: self._spec_reset())
+        self.spec_canvas.bind("<MouseWheel>", self._spec_wheel)
+        self.spec_canvas.bind("<Button-4>", lambda e: self._spec_zoom(1.25, e.x))
+        self.spec_canvas.bind("<Button-5>", lambda e: self._spec_zoom(0.8, e.x))
+        for seq in ("<plus>", "<equal>", "<KP_Add>"):
+            self.spec_canvas.bind(seq, lambda e: self._spec_zoom(1.25))
+        for seq in ("<minus>", "<KP_Subtract>"):
+            self.spec_canvas.bind(seq, lambda e: self._spec_zoom(0.8))
+        for seq, frac in (("<Left>", -0.12), ("<Right>", 0.12)):
+            self.spec_canvas.bind(seq, lambda e, f=frac: self._spec_pan(f))
+        self.spec_canvas.bind("<Home>", lambda e: self._spec_reset())
         self.info = tk.Text(rf, height=7, wrap="word", font=("Consolas", 9),
                             background="#f7f7f7")
         self.info.pack(fill=tk.X, pady=(3, 0))
@@ -272,9 +302,43 @@ class App(tk.Tk):
         Q.reset_cache()
         self._std = None
         self._std_key = None
+        self._refresh_mac_sets()
         self.log("Калибровка: %s (%s)" % (p.title, p.slug))
         if serial:
             self.log("  выбор запомнен для детектора S/N %s" % serial)
+        if self.lst.curselection():
+            self.on_analysis_select()
+
+    # ------------------------------------------------------ absorption tables
+    def _refresh_mac_sets(self):
+        """fill the μ/ρ combobox; called at start and after a profile change"""
+        self._mac_sets = Q.mac_sets()
+        titles = [s.title for s in self._mac_sets]
+        self.mac_box.configure(values=titles)
+        active = Q.mac_file()
+        for i, s in enumerate(self._mac_sets):
+            if os.path.abspath(s.path) == os.path.abspath(active):
+                self.mac_box.current(i)
+                break
+        else:
+            if titles:
+                self.mac_box.current(0)
+
+    def on_mac_change(self, _evt=None):
+        i = self.mac_box.current()
+        if not (0 <= i < len(self._mac_sets)):
+            return
+        s = self._mac_sets[i]
+        Q.set_active_mac_set(s.slug)
+        Q.reset_cache()
+        self.log("Коэффициенты поглощения: %s (%s)" % (s.title, os.path.basename(s.path)))
+        if self.lst.curselection():
+            self.on_analysis_select()
+
+    def on_absorption_change(self):
+        on = bool(self.absorb_var.get())
+        Q.set_absorption_enabled(on)
+        self.log("Поправка на поглощение: %s" % ("включена" if on else "выключена"))
         if self.lst.curselection():
             self.on_analysis_select()
 
@@ -288,15 +352,22 @@ class App(tk.Tk):
                     if f not in files:
                         files.append(f)
         rows = "\n".join(Q.profile_lines(root))
+        macs = "\n".join(Q.mac_lines(root)) or "  (нет таблиц)"
         messagebox.showinfo(
             "Калибровка",
             "Активный профиль:\n  %s (%s)\n\nПапка профиля:\n  %s\n\n"
-            "Корень калибровки:\n  %s\n\nФайлы:\n  %s\n\n"
+            "Корень калибровки:\n  %s\n\n"
+            "Коэффициенты поглощения μ/ρ:\n  %s\n  файл: %s\n  поправка на "
+            "поглощение: %s\n\nТаблицы μ/ρ (* — активная):\n%s\n\n"
+            "Файлы:\n  %s\n\n"
             "Все профили (* — активный):\n%s\n\n"
             "Профиль выбирается по серийному номеру детектора проекта; "
             "другой прибор — другая папка с xpp_standards.csv и profile.ini. "
+            "Наборы μ/ρ лежат в calibration\\mac\\<имя>.csv (+ .ini с названием). "
             "Переменная окружения NEWINCA_CALIB заменяет корень калибровки."
-            % (p.title, p.slug, p.path, root, "\n  ".join(files) or "—", rows))
+            % (p.title, p.slug, p.path, root, Q.mac_title(), Q.mac_file(),
+               "включена" if Q.absorption_enabled() else "выключена",
+               macs, "\n  ".join(files) or "—", rows))
 
     def choose_out(self):
         d = filedialog.askdirectory(title="Папка для результатов",
@@ -581,7 +652,96 @@ class App(tk.Tk):
 
     def _draw_spectrum(self, sp):
         self._spec = (sp.counts(), [l for l in sp.labels() if 0 < l[2] < 21000])
+        self._view = None                 # a new spectrum starts at full range
         self._redraw_spectrum()
+
+    # ---- spectrum view: zoom and pan ---------------------------------------
+    def _spec_limits(self):
+        data = getattr(self, "_spec", None)
+        if not data or len(data[0]) < 2:
+            return None
+        n = len(data[0])
+        return I.to_energy(0) / 1000.0, I.to_energy(n - 1) / 1000.0
+
+    def _current_view(self):
+        limits = self._spec_limits()
+        if not limits:
+            return None
+        lo, hi = self._view or limits
+        return max(limits[0], lo), min(limits[1], hi)
+
+    def _set_view(self, lo, hi):
+        limits = self._spec_limits()
+        if not limits:
+            return
+        full = limits[1] - limits[0]
+        span = max(hi - lo, full / 400.0)      # stop at 1/400 of the full range
+        centre = (lo + hi) / 2.0
+        lo, hi = centre - span / 2.0, centre + span / 2.0
+        if lo < limits[0]:
+            lo, hi = limits[0], limits[0] + span
+        if hi > limits[1]:
+            lo, hi = limits[1] - span, limits[1]
+        if span >= full:
+            self._view = None
+        else:
+            self._view = (lo, hi)
+        self._redraw_spectrum()
+
+    def _spec_reset(self):
+        self._view = None
+        self._redraw_spectrum()
+
+    def _spec_zoom(self, factor, x=None):
+        view = self._current_view()
+        if not view:
+            return
+        lo, hi = view
+        if x is None:
+            anchor = (lo + hi) / 2.0
+        else:
+            c = self.spec_canvas
+            L, R = 52, 14
+            w = max(c.winfo_width(), 200)
+            frac = min(1.0, max(0.0, (x - L) / max(1.0, (w - R - L))))
+            anchor = lo + frac * (hi - lo)
+        self._set_view(anchor - (anchor - lo) / factor,
+                       anchor + (hi - anchor) / factor)
+
+    def _spec_pan(self, fraction):
+        view = self._current_view()
+        if not view:
+            return
+        lo, hi = view
+        shift = (hi - lo) * fraction
+        self._set_view(lo + shift, hi + shift)
+
+    def _spec_wheel(self, event):
+        self.spec_canvas.focus_set()
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            return
+        self._spec_zoom(1.25 if delta > 0 else 0.8, event.x)
+
+    def _spec_press(self, event):
+        self.spec_canvas.focus_set()
+        view = self._current_view()
+        if not view:
+            return
+        self._drag = (event.x, view)
+
+    def _spec_drag(self, event):
+        if not getattr(self, "_drag", None):
+            return
+        x0, (lo, hi) = self._drag
+        c = self.spec_canvas
+        L, R = 52, 14
+        width = max(1.0, max(c.winfo_width(), 200) - R - L)
+        shift = -(event.x - x0) / width * (hi - lo)
+        self._set_view(lo + shift, hi + shift)
+
+    def _spec_release(self, _event=None):
+        self._drag = None
 
     def _redraw_spectrum(self):
         c = self.spec_canvas
@@ -613,15 +773,22 @@ class App(tk.Tk):
                              if step * decade >= target)
             ymax = math.ceil(top / tick_step) * tick_step
             ticks = range(0, ymax + 1, tick_step)
-        e_lo = I.to_energy(0) / 1000.0
-        e_hi = I.to_energy(n - 1) / 1000.0
+
+        view = self._current_view()
+        if not view:
+            return
+        e_lo, e_hi = view
+        span = e_hi - e_lo
 
         def X(e_kev):
-            return x0 + (x1 - x0) * (e_kev - e_lo) / (e_hi - e_lo)
+            return x0 + (x1 - x0) * (e_kev - e_lo) / span
 
         def Y(v):
             value = math.log10(v + 1) if logarithmic else v
             return y1 - (y1 - y0) * (value / ymax)
+
+        def E_of_ch(ch):
+            return I.to_energy(ch) / 1000.0
 
         # grid
         for tick in ticks:
@@ -629,38 +796,49 @@ class App(tk.Tk):
             c.create_line(x0, y, x1, y, fill="#243040")
             c.create_text(x0 - 6, y, text="%d" % tick, anchor="e",
                           fill=AXIS, font=(UI_FONT, 8))
-        e = 0.0
-        while e <= e_hi:
-            x = X(e)
+        step = next((s for s in (0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0)
+                     if span / s <= 12), 10.0)
+        tick_e = math.ceil(e_lo / step) * step
+        while tick_e <= e_hi + 1e-9:
+            x = X(tick_e)
             if x >= x0:
                 c.create_line(x, y0, x, y1, fill="#1b2430")
-                c.create_text(x, y1 + 10, text="%g" % e, fill=AXIS,
+                text = ("%.2f" % tick_e) if step < 0.1 else \
+                       ("%.1f" % tick_e) if step < 1 else "%g" % tick_e
+                c.create_text(x, y1 + 10, text=text, fill=AXIS,
                               font=(UI_FONT, 8))
-            e += 1.0
+            tick_e += step
         c.create_rectangle(x0, y0, x1, y1, outline="#3a4a5e")
         c.create_text(x1, y1 + 22, text="кэВ", anchor="e", fill=AXIS,
                       font=(UI_FONT, 8))
 
         # spectrum: one value per pixel column (the maximum, so peaks survive)
+        ch_lo = max(0, int((e_lo * 1000.0) / I.EV_PER_CH + I.ZERO_CH) - 2)
+        ch_hi = min(n, int((e_hi * 1000.0) / I.EV_PER_CH + I.ZERO_CH) + 3)
         cols = max(1, int(x1 - x0))
-        step = n / cols
+        step_ch = max(0.05, (ch_hi - ch_lo) / cols)
         pts = []
-        for i in range(cols):
-            a = int(i * step)
-            b = max(a + 1, int((i + 1) * step))
-            seg = counts[a:b]
+        i = 0
+        while i < cols:
+            a = int(ch_lo + i * step_ch)
+            b = max(a + 1, int(ch_lo + (i + 1) * step_ch))
+            seg = counts[a:min(b, n)]
             if not seg:
-                continue
+                break
             v = max(seg)
             ch = a + seg.index(v)
-            pts.extend((X(I.to_energy(ch) / 1000.0), Y(v)))
+            pts.extend((X(E_of_ch(ch)), Y(v)))
+            i += 1
         if len(pts) > 3:
             c.create_line(*pts, fill="#7fd4ff", width=1, tags=("spectrum_curve",))
 
-        # Keep each saved line at its own energy.
+        # Keep each saved line at its own energy; only those inside the view.
         visible = []
         threshold = top * round(self.peak_threshold.get()) / 100
         for _idx, name, energy in labels:
+            e = energy / 1000.0
+            if not (e_lo < e < e_hi):
+                continue
             ch = int(round(energy / I.EV_PER_CH + I.ZERO_CH))
             if ch < 1 or ch >= n:
                 continue
@@ -695,8 +873,10 @@ class App(tk.Tk):
                     break
             c.addtag_withtag("peak_label", label)
 
-        c.create_text(x0, 6, anchor="w", text="%d каналов" % n, fill=AXIS,
-                      font=(UI_FONT, 8))
+        hint = "колесо / +- масштаб, ←→ сдвиг, двойной щелчок — весь спектр"
+        c.create_text(x0, 6, anchor="w", fill=AXIS, font=(UI_FONT, 8),
+                      text="%d каналов · %.2f–%.2f кэВ · %s"
+                      % (n, e_lo, e_hi, hint))
 
     def _show_info(self, n, sp):
         em = sp.em_conditions()
@@ -716,11 +896,12 @@ class App(tk.Tk):
         if inf.get("date"):
             bits.append(inf["date"].strftime("%Y-%m-%d %H:%M"))
         lines.append("   ".join(bits))
-        els = sorted(analysis._Z_SYMBOL.get(z, str(z)) for z in (sp.element_set() or ()))
-        lines.append("Всего импульсов: %d   максимум: %d   элементы: %s"
-                     % (sum(counts), max(counts) if counts else 0,
-                        ", ".join(els) or "—"))
+        lines.append("Всего импульсов: %d   максимум: %d"
+                     % (sum(counts), max(counts) if counts else 0))
         labels = sp.labels()
+        on_spectrum = analysis.labelled_elements(sp)
+        if on_spectrum:
+            lines.append("На спектре: " + ", ".join(on_spectrum))
         if labels:
             lines.append("Метки INCA: " + ", ".join("%s %.3f кэВ" % (name, ev / 1000)
                                                    for _, name, ev in labels))
@@ -732,19 +913,41 @@ class App(tk.Tk):
                 if not std:
                     lines.append("Расчёт: нет калибровочных данных")
                 else:
-                    comp, _areas = analysis.quantify(counts, std,
-                                                     allowed=sp.element_set())
-                    ox = analysis.to_oxides(comp)
-                    if ox:
-                        txt = "   ".join("%s %.2f" % (k, ox[k] * 100)
-                                         for k in analysis.OXIDE_ORDER
-                                         if ox.get(k, 0) * 100 >= 0.05)
-                        lines.append("Оксиды, мас.%: " + (txt or "—"))
-                        lines.append("Сумма: %.2f" % (sum(ox.values()) * 100))
+                    comp, ox, details = analysis.quantify_spectrum(sp, std)
+                    # exactly the elements of the spectrum, in their own order:
+                    # an element is either a number here or explicitly explained
+                    parts, rest = [], []
+                    for sym in details["quantified"]:
+                        name = analysis.EL[sym][2]
+                        if not name:
+                            continue          # C, O, F, Cl: shown below as elements
+                        value = ox.get(name, 0.0) * 100
+                        if value >= 0.005:
+                            parts.append("%s %.2f" % (name, value))
+                        else:
+                            rest.append("%s <0.01" % name)
+                    if parts:
+                        lines.append("Состав, мас.%: " + "   ".join(parts))
+                        total = sum(ox.values()) * 100 if ox else 0.0
+                        lines.append("Сумма оксидов: %.2f" % total)
                     else:
-                        lines.append("Расчёт: нет элементов, дающих оксиды")
+                        lines.append("Состав: пиков выше порога нет")
+                    if rest:
+                        lines.append("Ниже 0.01: " + ", ".join(rest))
+                    no_ox = [s for s in details["no_oxide"]
+                             if comp.get(s, 0) * 100 >= 0.005]
+                    if no_ox:
+                        lines.append("Без оксида (элемент): "
+                                     + ", ".join("%s %.2f" % (s, comp[s] * 100)
+                                                 for s in no_ox))
+                    if details["no_standard"]:
+                        lines.append("Нет стандарта в этой калибровке: "
+                                     + ", ".join(details["no_standard"]))
             except Exception as e:
                 lines.append("Расчёт недоступен: %s" % e)
+        lines.append("μ/ρ: %s; поправка на поглощение %s"
+                     % (Q.mac_title(),
+                        "включена" if Q.absorption_enabled() else "выключена"))
         self.info.configure(state=tk.NORMAL)
         self.info.delete("1.0", tk.END)
         self.info.insert("1.0", "\n".join(lines))

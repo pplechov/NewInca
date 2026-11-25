@@ -22,12 +22,14 @@ def usage():
             "  %s export   <проект.ipj> [папка] [--profile ИМЯ]\n"
             "  %s quant    <проект.ipj> [папка] [--profile ИМЯ]\n"
             "  %s profiles\n"
-            "  %s selftest <файл.ipj | папка> ...\n" % ((p,) * 6))
+            "  %s macs     [--mac ИМЯ] [--absorption вкл|выкл]\n"
+            "  %s selftest <файл.ipj | папка> ...\n" % ((p,) * 7))
 
 
 def _parse(argv):
     """split a command line into positionals and the known switches"""
-    args, opts = [], {"profile": None, "json": False}
+    args, opts = [], {"profile": None, "json": False, "mac": None,
+                      "absorption": None}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -40,6 +42,24 @@ def _parse(argv):
             opts["profile"] = a.split("=", 1)[1]
             i += 1
             continue
+        elif a in ("--mac", "-m"):
+            if i + 1 < len(argv):
+                opts["mac"] = argv[i + 1]
+                i += 2
+                continue
+        elif a.startswith("--mac="):
+            opts["mac"] = a.split("=", 1)[1]
+            i += 1
+            continue
+        elif a in ("--absorption", "-a"):
+            if i + 1 < len(argv):
+                opts["absorption"] = argv[i + 1]
+                i += 2
+                continue
+        elif a.startswith("--absorption="):
+            opts["absorption"] = a.split("=", 1)[1]
+            i += 1
+            continue
         elif a in ("--json", "-j"):
             opts["json"] = True
             i += 1
@@ -47,6 +67,24 @@ def _parse(argv):
         args.append(a)
         i += 1
     return args, opts
+
+
+def _apply_mac(opts):
+    """honour --mac / --absorption without touching the saved settings"""
+    import quant as Q
+    if opts.get("mac"):
+        s = Q.mac_set(opts["mac"])
+        if s is None:
+            print("нет таблицы μ/ρ «%s»; есть: %s"
+                  % (opts["mac"], ", ".join(x.slug for x in Q.mac_sets())))
+            return False
+        Q.set_active_mac_set(s.slug)
+        Q.reset_cache()
+    if opts.get("absorption") is not None:
+        on = str(opts["absorption"]).strip().lower() in ("1", "on", "yes", "true",
+                                                         "вкл", "да")
+        Q.set_absorption_enabled(on)
+    return True
 
 
 def cmd_info(path, as_json=False):
@@ -69,6 +107,9 @@ def cmd_info(path, as_json=False):
         print("  " + line)
     print("  Профиль    : %s (%s) — %s" % (prof.title, prof.slug, reason))
     print("  Калибровка : %s" % prof.standards_path)
+    print("  μ/ρ        : %s (%s)" % (Q.mac_title(), Q.mac_file()))
+    print("  Поглощение : %s" % ("поправка включена" if Q.absorption_enabled()
+                                 else "поправка выключена"))
     return 0
 
 
@@ -86,8 +127,21 @@ def main(argv):
             print(line)
         return 0
 
+    if cmd == "macs":
+        import quant as Q
+        if not _apply_mac(opts):
+            return 1
+        print("корень калибровки: %s" % Q.calibration_root())
+        for line in Q.mac_lines():
+            print(line)
+        print("поправка на поглощение: %s"
+              % ("включена" if Q.absorption_enabled() else "выключена"))
+        return 0
+
     if len(args) < 2:
         print(usage())
+        return 1
+    if not _apply_mac(opts):
         return 1
     proj = args[1]
     out = args[2] if len(args) > 2 else os.path.join(os.getcwd(), "out")

@@ -8,6 +8,7 @@ newINCA -- read INCA .ipj / .ipl project files without INCA.
     newINCA.exe export   <project> [dir] [--profile NAME]
     newINCA.exe quant    <project> [dir] [--profile NAME]
     newINCA.exe profiles              calibration profiles available
+    newINCA.exe macs                  mass absorption tables available
     newINCA.exe selftest <file|dir>   read every project and report problems
 """
 import os, sys
@@ -18,7 +19,7 @@ if HERE not in sys.path:
 
 from version import __version__
 
-CLI_COMMANDS = {"list", "info", "profiles", "export", "quant", "selftest"}
+CLI_COMMANDS = {"list", "info", "profiles", "macs", "export", "quant", "selftest"}
 
 
 def _safe_streams():

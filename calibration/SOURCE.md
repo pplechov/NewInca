@@ -6,9 +6,13 @@
 
 ```
 calibration\
-├─ mac.csv, elements.csv, lines.csv     физика, общая для всех приборов
-├─ xpp_standards.csv                    калибровка по умолчанию
-├─ profile.ini                          что это за калибровка
+├─ mac\                                  наборы коэффициентов поглощения
+│   ├─ chantler.csv                      μ/ρ, Chantler/NIST (xraylib)
+│   └─ chantler.ini                      [mac] title / source / notes
+├─ mac.csv                               прежнее место одной таблицы (fallback)
+├─ elements.csv, lines.csv               физика, общая для всех приборов
+├─ xpp_standards.csv                     калибровка по умолчанию
+├─ profile.ini                           что это за калибровка
 ├─ SOURCE.md
 └─ profiles\
     ├─ msu-cpx-opx-amp-bt\              по папке на протокол измерения
@@ -21,8 +25,9 @@ calibration\
 ```
 
 Профиль — это папка с `xpp_standards.csv` и `profile.ini`. Физику
-(`mac.csv`, `elements.csv`, `lines.csv`) можно положить и в саму папку
-профиля — тогда она берётся оттуда, иначе из корня калибровки.
+(`elements.csv`, `lines.csv`) можно положить и в саму папку профиля — тогда она
+берётся оттуда, иначе из корня калибровки. Таблица μ/ρ выбирается отдельно
+списком «μ/ρ» в окне (или `--mac` в командной строке) и живёт в `mac\`.
 
 ## profile.ini
 
@@ -101,11 +106,47 @@ tools\mdb_export.cmd "MSU inca\Data\Calib\20kV Ol 2016 февраль\XPP Standa
 
 Именно по этой таблице программа считает k-отношения.
 
-## mac.csv
+## mac.csv / mac\chantler.csv
 
 Коэффициенты массового поглощения μ/ρ, см²/г, для Z = 1…92 и набора энергий
 линий. Источник — библиотека **xraylib** (данные Chantler/NIST), выгружено
-скриптом `make_physics.py`. Столбцы: `Z;energy_keV;mu_over_rho_cm2_per_g`.
+скриптом `make_physics.py`. Столбцы: `Z,energy_keV,mu_over_rho_cm2_per_g`.
+
+## Наборы μ/ρ (mac\)
+
+Таблица поглощения — независимая физика, поэтому она вынесена в отдельные файлы
+и выбирается в интерфейсе (список «μ/ρ») или ключом `--mac`:
+
+| файл | что это |
+|---|---|
+| `mac\chantler.csv` | Chantler/NIST из xraylib, по умолчанию |
+| `mac\<имя>.csv` | любой свой набор в том же формате |
+| `mac\<имя>.ini` | `[mac] title = …`, `source = …`, `notes = …` |
+
+Свой файл достаточно положить в папку — пересборка не нужна. Профиль может
+указать набор строкой `mac = <имя>` в `profile.ini`; выбор пользователя
+запоминается в `settings.ini` и имеет приоритет.
+
+### Почему здесь нет таблицы INCA
+
+В INCA μ/ρ не лежит файлом. Её считает
+`OIMAGCorrectionProcedures.dll` (`IQuantFunctions.CalcMassAbsorpCoeffByEnergy`)
+по лицензируемой «X-ray database» (`IXrayDatabase` в
+`OIMAGElementProperties.dll`, диапазон Z = 1…98). Проверено на поставке
+INCA 18 D SP4: ни одного файла с таблицей μ/ρ в ней нет, только базы
+стандартов Access (`XPP Standards.mdb`, `Factory.mdb`, `wavestds.mdb`) и код.
+
+Сам COM-объект загружается без установки INCA (через `DllGetClassObject`,
+даже без прав администратора), `Initialise()` отвечает успехом, но на любой
+запрос коэффициента возвращается `0x80040513 «The password for the X-ray
+database has not been set»`: нужен вендорский ключ Oxford. Перебор пустой
+строки, `x` и `INCA` не проходит; в пакете ключа нет. Подробный протокол
+попытки — `_analysis\mac_inca\README.md`.
+
+Практический вывод: чтобы получить «как в INCA», таблицу надо выгрузить там,
+где INCA установлена и лицензирована (в её UI или тем же скриптом
+`_analysis\mac_inca\dump_mac.ps1 -Password <ключ>`), и положить CSV в
+`calibration\mac\`.
 
 ## elements.csv
 

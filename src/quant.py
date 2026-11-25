@@ -35,6 +35,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PROFILE_INI = "profile.ini"
 SETTINGS_INI = "settings.ini"
 STANDARDS_CSV = "xpp_standards.csv"
+MAC_DIR = "mac"                # calibration\mac\<slug>.csv -- the absorption sets
+MAC_INI = ".ini"               # calibration\mac\<slug>.ini -- title / source
 
 
 APP_NAME = "newINCA"
@@ -96,6 +98,7 @@ class Profile:
 
     def __init__(self, slug, path, meta=None):
         meta = meta or {}
+        self.meta = meta
         self.slug = slug
         self.path = os.path.abspath(path)
         self.title = meta.get("title") or ("по умолчанию" if slug == "default"
@@ -107,6 +110,7 @@ class Profile:
         self.e0 = meta.get("e0", "")
         self.notes = meta.get("notes", "")
         self.source = meta.get("source", "")
+        self.mac_slug = (meta.get("mac") or "").strip()
         self.is_default = str(meta.get("default", "")).strip().lower() in \
             ("1", "yes", "true", "да")
 
@@ -181,6 +185,7 @@ def calibration_root():
         if not c or not os.path.isdir(c):
             continue
         if (os.path.exists(os.path.join(c, "mac.csv"))
+                or os.path.isdir(os.path.join(c, MAC_DIR))
                 or os.path.exists(os.path.join(c, STANDARDS_CSV))):
             return os.path.abspath(c)
     return os.path.abspath(cands[-1])
@@ -333,6 +338,174 @@ def profile_lines(root=None):
 
 
 # --------------------------------------------------------------------------- #
+#  absorption coefficient sets (mu/rho tables)
+# --------------------------------------------------------------------------- #
+class MacSet:
+    """One table of mass absorption coefficients, cm2/g.
+
+    The numbers differ between tables: newINCA computes its own from Chantler
+    (xraylib), INCA has its own inside OIMAGCorrectionProcedures.dll.  Both are
+    μ/ρ of the *same* physical quantity, but a different table shifts the
+    absorption correction by a per-cent, not by a factor.  Keeping the tables in
+    separate files makes the choice explicit instead of hidden.
+    """
+
+    def __init__(self, slug, path, meta=None):
+        meta = meta or {}
+        self.slug = slug
+        self.path = os.path.abspath(path)
+        self.title = meta.get("title") or slug
+        self.source = meta.get("source", "")
+        self.notes = meta.get("notes", "")
+
+    def __repr__(self):
+        return "<MacSet %s %r>" % (self.slug, self.title)
+
+    def rows(self):
+        """{(Z, energy_keV): mu_over_rho} -- the same layout as mac.csv."""
+        out = {}
+        with open(self.path, encoding="utf-8-sig") as fh:
+            for r in csv.DictReader(fh):
+                try:
+                    out[(int(r["Z"]), round(float(r["energy_keV"]), 3))] = \
+                        float(r["mu_over_rho_cm2_per_g"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return out
+
+
+def mac_sets(root=None):
+    """[MacSet] -- calibration\\mac\\*.csv, then the legacy calibration\\mac.csv."""
+    root = root or calibration_root()
+    out = []
+    d = os.path.join(root, MAC_DIR)
+    if os.path.isdir(d):
+        for name in sorted(os.listdir(d)):
+            if not name.lower().endswith(".csv"):
+                continue
+            slug = os.path.splitext(name)[0]
+            meta = _read_ini(os.path.join(d, slug + MAC_INI))
+            out.append(MacSet(slug, os.path.join(d, name), meta))
+    if not out:
+        legacy = os.path.join(root, "mac.csv")
+        if os.path.isfile(legacy):
+            out.append(MacSet("chantler", legacy,
+                              {"title": "Chantler (xraylib)"}))
+    return out
+
+
+def _read_ini(path):
+    """An .ini whose single section may be called [mac] or anything else."""
+    if not os.path.isfile(path):
+        return {}
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        cp.read(path, encoding="utf-8-sig")
+    except Exception:
+        return {}
+    for sec in cp.sections():
+        return dict(cp.items(sec))
+    return {}
+
+
+def mac_set(slug, root=None):
+    if not slug:
+        return None
+    for s in mac_sets(root):
+        if s.slug == slug or s.title == slug:
+            return s
+    return None
+
+
+def set_active_mac_set(slug):
+    """Remember which μ/ρ table to use (empty string = follow the profile)."""
+    cp = settings()
+    if not cp.has_section("calibration"):
+        cp.add_section("calibration")
+    cp.set("calibration", "mac", slug or "")
+    return _save_settings(cp)
+
+
+def active_mac_set(root=None):
+    """The μ/ρ table the program currently uses, or None for a legacy layout."""
+    sets = mac_sets(root)
+    wanted = settings().get("calibration", "mac", fallback="")
+    if not wanted:
+        wanted = getattr(active_profile(root), "mac_slug", "") or ""
+    for s in sets:
+        if s.slug == wanted:
+            return s
+    return sets[0] if sets else None
+
+
+def mac_file():
+    """Path of the μ/ρ table actually read.
+
+    Precedence: the user's choice in the GUI > a mac.csv inside a *profile*
+    folder (an instrument whose absorption table travelled with its calibration)
+    > the first set in calibration\\mac > the old calibration\\mac.csv.
+    """
+    chosen = settings().get("calibration", "mac", fallback="")
+    if chosen:
+        s = mac_set(chosen)
+        if s is not None:
+            return s.path
+    p = active_profile()
+    root = calibration_root()
+    own = os.path.join(p.path, "mac.csv")
+    if os.path.isfile(own) and os.path.abspath(p.path) != os.path.abspath(root):
+        return own
+    s = active_mac_set()
+    if s is not None:
+        return s.path
+    return os.path.join(root, "mac.csv")
+
+
+def mac_title():
+    """Short human-readable name of the active μ/ρ table."""
+    path = mac_file()
+    base = os.path.basename(path)
+    s = active_mac_set()
+    if s is not None and os.path.abspath(s.path) == os.path.abspath(path):
+        return s.title
+    if base.lower() == "mac.csv":
+        return "Chantler (xraylib)"
+    return base
+
+
+def mac_lines(root=None):
+    """human readable list of μ/ρ tables, for the GUI/CLI"""
+    active = mac_file()
+    out = []
+    for s in mac_sets(root):
+        mark = "*" if os.path.abspath(s.path) == os.path.abspath(active) else " "
+        out.append("%s %-20s %-38s %s" % (mark, s.slug, s.title,
+                                          os.path.basename(s.path)))
+    return out
+
+
+def absorption_enabled():
+    """Is the matrix (absorption) correction switched on?
+
+    Off by default: the standard intensities INCA stores ("Norm Area Std")
+    already behave as matrix-normalised k-factors -- on the K-feldspar
+    benchmark the plain k-ratio reproduces the mineral to 0.2 wt %, and
+    applying f(std)/f(sample) on top of it moves K2O by -3 wt %.  The switch is
+    there for the tables that are raw intensities, and to see the effect.
+    """
+    return settings().get("calibration", "absorption",
+                          fallback="0").strip().lower() in ("1", "yes", "true", "on")
+
+
+def set_absorption_enabled(on):
+    cp = settings()
+    if not cp.has_section("calibration"):
+        cp.add_section("calibration")
+    cp.set("calibration", "absorption", "1" if on else "0")
+    return _save_settings(cp)
+
+
+# --------------------------------------------------------------------------- #
 #  physics tables
 # --------------------------------------------------------------------------- #
 PHYS = None
@@ -346,7 +519,8 @@ def _load():
         return _TAB
     PHYS = active_profile().physics_dir()
     mac = {}
-    with open(physics_file("mac.csv"), encoding="utf-8") as fh:
+    mac_path = mac_file()
+    with open(mac_path, encoding="utf-8-sig") as fh:
         for r in csv.DictReader(fh):
             mac[(int(r["Z"]), round(float(r["energy_keV"]), 3))] = float(r["mu_over_rho_cm2_per_g"])
     el = {}
@@ -354,6 +528,7 @@ def _load():
         for r in csv.DictReader(fh):
             el[int(r["Z"])] = r
     _TAB["mac"] = mac
+    _TAB["mac_path"] = mac_path
     _TAB["el"] = el
     return _TAB
 
@@ -376,17 +551,35 @@ def fluor_yield_k(z):
 
 
 def mac(z_absorber, energy_keV):
-    """mass absorption coefficient, cm2/g.  nearest tabulated energy."""
+    """mass absorption coefficient, cm2/g.
+
+    Between two tabulated energies the table is interpolated in log-log (μ/ρ is
+    a power law of the photon energy), except where the two neighbours differ by
+    more than a factor of three: that is an absorption edge, and interpolating
+    across an edge would invent values that no table contains.
+    """
     t = _load()["mac"]
     e = round(energy_keV, 3)
     if (z_absorber, e) in t:
         return t[(z_absorber, e)]
-    # nearest
-    ks = [k for k in t if k[0] == z_absorber]
+    ks = sorted(k[1] for k in t if k[0] == z_absorber)
     if not ks:
         return 0.0
-    k = min(ks, key=lambda kk: abs(kk[1] - e))
-    return t[k]
+    lo = min(ks, key=lambda x: abs(x - e))
+    a = t[(z_absorber, lo)]
+    i = ks.index(lo)
+    pair = None
+    if i + 1 < len(ks) and ks[i] < e < ks[i + 1]:
+        pair = (lo, ks[i + 1])
+    elif i > 0 and ks[i - 1] < e < ks[i]:
+        pair = (ks[i - 1], lo)
+    if pair:
+        e1, e2 = pair
+        v1, v2 = t[(z_absorber, e1)], t[(z_absorber, e2)]
+        if v1 > 0 and v2 > 0 and max(v1, v2) / min(v1, v2) <= 3.0:
+            f = (math.log(e) - math.log(e1)) / (math.log(e2) - math.log(e1))
+            return math.exp(math.log(v1) + f * (math.log(v2) - math.log(v1)))
+    return a
 
 
 def mac_mixture(comp_wt, energy_keV):
@@ -443,6 +636,15 @@ def peak_area(counts, e_keV, ev_per_ch, zero_ch, fwhm_ev=120.0,
     so neighbouring lines are rejected instead of being absorbed into the
     background.  The residual of the peak window above that fit is the area.
     """
+    got = fit_peak(counts, e_keV, ev_per_ch, zero_ch, fwhm_ev=fwhm_ev,
+                   int_f=int_f, excl_f=excl_f, span_f=span_f, deg=deg,
+                   iters=iters)
+    return (got[0], got[1]) if got else (0.0, 0.0)
+
+
+def fit_peak(counts, e_keV, ev_per_ch, zero_ch, fwhm_ev=120.0,
+             int_f=0.55, excl_f=1.15, span_f=4.5, deg=2, iters=8):
+    """peak_area, but also returning the window: (net, err, centre, lo, hi)."""
     import numpy as np
     c = np.asarray(counts, dtype=float)
     n = len(c)
@@ -457,12 +659,12 @@ def peak_area(counts, e_keV, ev_per_ch, zero_ch, fwhm_ev=120.0,
     lo = max(lo, MIN_CH)
     hi = min(hi, n - 2)
     if plo < MIN_CH or phi > n - 2 or hi - lo < 12:
-        return 0.0, 0.0
+        return None
     x = np.arange(lo, hi + 1, dtype=float)
     y = c[lo:hi + 1]
     keep = np.abs(x - c0) > excl                   # everything but the peak
     if keep.sum() < deg + 4:
-        return 0.0, 0.0
+        return None
     use = keep.copy()
     for _ in range(iters):
         if use.sum() < deg + 3:
@@ -482,7 +684,97 @@ def peak_area(counts, e_keV, ev_per_ch, zero_ch, fwhm_ev=120.0,
     for i in range(plo, phi + 1):
         net += c[i] - np.polyval(co, i - c0)
         gross += c[i]
-    return net, math.sqrt(max(gross, 1.0))
+    return net, math.sqrt(max(gross, 1.0)), c0, plo, phi
+
+
+def _gauss_fraction(centre, sigma, lo, hi):
+    """How much of a unit Gaussian centred at ``centre`` falls inside [lo, hi]."""
+    if sigma <= 0:
+        return 1.0 if lo <= centre <= hi else 0.0
+    a = (lo - centre) / (sigma * math.sqrt(2.0))
+    b = (hi - centre) / (sigma * math.sqrt(2.0))
+    return 0.5 * (math.erf(b) - math.erf(a))
+
+
+def measure_lines(counts, components, ev_per_ch, zero_ch, fwhm_ev=120.0,
+                  int_f=0.55, excl_f=1.15, span_f=4.5, deg=2, iters=8):
+    """Several overlapping K lines at once: {key: net counts in its own window}.
+
+    ``components``: [(key, ka_keV, kb_keV or None, kb_over_ka), ...]
+
+    Each window is integrated on its own local background, as in peak_area.  But
+    two windows can contain the same photons: Cr K-beta (5.95 keV) sits inside
+    the Mn K-alpha window (5.90), Ti K-beta (4.93) inside V K-alpha (4.95).  So
+    the windows are then explained by a small linear model: every element
+    contributes its K-alpha Gaussian plus its K-beta Gaussian at the tabulated
+    K-beta/K-alpha ratio, and least squares splits the shared counts between
+    them.  What comes back is the part of each K-alpha that is its own, so a
+    neighbouring K-beta can no longer be reported as a new element.
+    """
+    import numpy as np
+    observations, centres, keys = [], [], []
+    sigma = fwhm_ev / 2.3548 / ev_per_ch
+    for key, ka, kb, _ratio in components:
+        got = fit_peak(counts, ka, ev_per_ch, zero_ch, fwhm_ev=fwhm_ev,
+                       int_f=int_f, excl_f=excl_f, span_f=span_f, deg=deg,
+                       iters=iters)
+        keys.append(key)
+        if got is None:
+            observations.append(0.0)
+            centres.append(None)
+            continue
+        observations.append(max(got[0], 0.0))
+        centres.append((got[2], got[3], got[4]))
+    unknown = [k for k, c in zip(keys, centres) if c is not None]
+    if not unknown:
+        return {k: 0.0 for k in keys}
+    rows = [i for i, c in enumerate(centres) if c is not None]
+    # M[i][j]: how much of component j lands in the window measured for row i
+    M = np.zeros((len(rows), len(unknown)))
+    for a, i in enumerate(rows):
+        _c0, plo, phi = centres[i]
+        for b, (key, ka, kb, ratio) in enumerate(
+                (components[keys.index(u)] for u in unknown)):
+            centre_ka = ka * 1000.0 / ev_per_ch + zero_ch
+            M[a, b] += _gauss_fraction(centre_ka, sigma, plo - 0.5, phi + 0.5)
+            if kb and ratio:
+                centre_kb = kb * 1000.0 / ev_per_ch + zero_ch
+                M[a, b] += ratio * _gauss_fraction(centre_kb, sigma,
+                                                   plo - 0.5, phi + 0.5)
+    obs = np.array([observations[i] for i in rows], dtype=float)
+    amps = _solve_nonneg(M, obs)
+    out = {k: 0.0 for k in keys}
+    for b, key in enumerate(unknown):
+        comp = components[keys.index(key)]
+        centre_ka = comp[1] * 1000.0 / ev_per_ch + zero_ch
+        i = rows[unknown.index(key)]
+        _c0, plo, phi = centres[i]
+        own = _gauss_fraction(centre_ka, sigma, plo - 0.5, phi + 0.5)
+        out[key] = own * amps[b]
+    return out
+
+
+def _solve_nonneg(M, obs, rounds=8):
+    """least squares with non-negative amplitudes (drop the worst, solve again)"""
+    import numpy as np
+    n = M.shape[1]
+    amps = np.zeros(n)
+    active = list(range(n))
+    while active:
+        sub = M[:, active]
+        try:
+            sol, *_ = np.linalg.lstsq(sub, obs, rcond=None)
+        except Exception:
+            break
+        if (sol >= -1e-9).all() or len(active) == 1:
+            amps[active] = np.maximum(sol, 0.0)
+            break
+        worst = int(np.argmin(sol))
+        active.pop(worst)
+        if rounds <= 0:
+            break
+        rounds -= 1
+    return amps
 
 
 def find_peaks(counts, ev_per_ch, zero_ch, thresh=0.04, min_ch=MIN_CH):
