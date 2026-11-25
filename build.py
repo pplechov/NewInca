@@ -141,8 +141,8 @@ def zip_folder(top, target, root_in_zip):
 def package(target, kind):
     """A .app must keep its symlinks and permissions: use ditto on macOS."""
     if kind == "app":
-        out = os.path.join(DIST, "newINCA-%s-%s.zip" % (
-            "macOS", platform.machine() or "arm64"))
+        out = os.path.join(DIST, "newINCA-%s-macOS-%s.zip" % (
+            __version__, platform.machine() or "arm64"))
         if os.path.exists(out):
             os.remove(out)
         subprocess.run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent",
