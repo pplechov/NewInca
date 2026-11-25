@@ -30,7 +30,12 @@ DATA_DIRS = ["calibration", "points", "tools"]
 
 
 def log(msg):
-    print(msg, flush=True)
+    """Print on consoles whose code page has no Cyrillic (a CI runner, cmd.exe)."""
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(msg.encode(enc, "replace").decode(enc, "replace"), flush=True)
 
 
 def add_data_args():
