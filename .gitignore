@@ -24,3 +24,6 @@ ui.ini
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# локальный черновик
+ToDo.txt
