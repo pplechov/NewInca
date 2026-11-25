@@ -92,8 +92,8 @@ def from_project(fov):
     """[(label, spectrum_id, [(x, y), ...])] stored by INCA for this site.
 
     A point analysis yields one coordinate, a rastered one yields the whole
-    chord (a vertical run of rows); the pipeline draws the first as a small
-    rectangle and the second as the rectangle bounding the chord.
+    chord (a vertical run of rows); the pipeline draws the first as a circle
+    and the second as the rectangle bounding the chord.
     """
     out = []
     try:

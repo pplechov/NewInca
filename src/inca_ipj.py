@@ -770,6 +770,17 @@ class Image:
     def label(self):
         return cp1251_runs(self.stream("image_label"), 2)
 
+    def field_width_um(self):
+        """Horizontal field width from the grey image's v5 acquisition record."""
+        d = stream_named(self.streams, "GreyImage/EMConditions/EMConditions")
+        if len(d) != 219 or struct.unpack_from("<I", d)[0] != 5:
+            return None
+        magnification, = struct.unpack_from("<I", d, 56)
+        reference_width_m, = struct.unpack_from("<d", d, 162)
+        if magnification and 0 < reference_width_m < 1:
+            return reference_width_m * 1e6 / magnification
+        return None
+
     def metadata(self):
         """ImageData is a 48-byte display/ROI record; only its version is
         unambiguous, so nothing else is guessed from it."""

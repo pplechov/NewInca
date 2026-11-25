@@ -161,7 +161,8 @@ def export_project(project_path, outdir, app_dir=None, log=print,
                 render.save_plain(grey, base + ".png")
                 render.annotate(grey, (m.width, m.height), base + "_annotated.png",
                                 title="%s — %s" % (s.name(), f.name()),
-                                points=pts, lines=lines, legend=rows, note=note)
+                                points=pts, lines=lines, legend=rows, note=note,
+                                field_width_um=im.field_width_um())
                 n_img += 1
                 log("  изображение %s  %dx%d %d бит  точек=%d  линий=%d"
                     % (im.id, m.width, m.height, m.bits, len(pts), len(lines)))
