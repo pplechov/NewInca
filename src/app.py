@@ -29,6 +29,74 @@ SPEC_BG = "#101418"
 AXIS = "#8899aa"
 
 
+def _fmt_counts(value):
+    """An axis label for a number of counts: '%g' would turn the top of the
+    scale into 1e+05, and a six-digit label does not fit the narrow axis"""
+    value = float(value)
+    for limit, suffix in ((1e9, "G"), (1e6, "M"), (1e3, "k")):
+        if abs(value) >= limit:
+            scaled = value / limit
+            if abs(scaled - round(scaled)) < 1e-9:
+                return "%d %s" % (round(scaled), suffix)
+            return "%.1f %s" % (scaled, suffix)
+    if abs(value - round(value)) < 1e-9:
+        return "%d" % round(value)
+    return "%.3g" % value
+
+
+def _crossing(a, b, edge):
+    """where the segment a-b meets the horizontal line y == edge"""
+    (xa, ya), (xb, yb) = a, b
+    if yb == ya:
+        return (xb, edge)
+    t = (edge - ya) / (yb - ya)
+    return (xa + t * (xb - xa), edge)
+
+
+def _runs_inside(points, lo, hi):
+    """Split a flat [x, y, x, y, ...] polyline into the parts with lo <= y <= hi.
+
+    A Tk canvas has no clipping rectangle, so a curve that leaves the zoomed
+    intensity window would be drawn over the axes; each run is cut exactly on
+    the border instead.  A steep edge leaves the window on one side and comes
+    back on the other, and the bit between the two crossings must survive.
+    Returns a list of flat point lists.
+    """
+    pts = [(points[i], points[i + 1]) for i in range(0, len(points) - 1, 2)]
+    runs, run = [], []
+
+    def flush():
+        if len(run) >= 4:
+            runs.append(list(run))
+        del run[:]
+
+    for a, b in zip(pts, pts[1:]):
+        inside_a, inside_b = lo <= a[1] <= hi, lo <= b[1] <= hi
+        if inside_a and inside_b:
+            if not run:
+                run.extend(a)
+            run.extend(b)
+        elif inside_a:
+            if not run:
+                run.extend(a)
+            run.extend(_crossing(a, b, lo if b[1] < lo else hi))
+            flush()
+        elif inside_b:
+            flush()
+            run.extend(_crossing(a, b, lo if a[1] < lo else hi))
+            run.extend(b)
+        elif (a[1] < lo < hi < b[1]) or (b[1] < lo < hi < a[1]):
+            flush()
+            enters, leaves = (lo, hi) if a[1] < lo else (hi, lo)
+            run.extend(_crossing(a, b, enters))
+            run.extend(_crossing(a, b, leaves))
+            flush()
+        else:
+            flush()
+    flush()
+    return runs
+
+
 # --------------------------------------------------------------------------- #
 #  UI settings: the last folders are remembered between runs
 # --------------------------------------------------------------------------- #
@@ -99,8 +167,17 @@ class App(tk.Tk):
         self._export_finished = False
         # spectrum view: (energy_lo, energy_hi) in keV, None = whole spectrum
         self._view = None
+        # the same for intensity, in the units of the chosen scale
+        # (log10(counts+1) or counts), None = whole axis
+        self._yview = None
+        # left margin of the plot, set by the widest intensity label
+        self._spec_left = 52
         self._spec_range = None
         self._drag = None
+        # composition table of the selected site: one row per analysis, plus a
+        # cache keyed by the spectrum and the settings that change the numbers
+        self._rows = []
+        self._row_cache = {}
 
         self._build_ui()
         self._refresh_profiles()
@@ -157,12 +234,25 @@ class App(tk.Tk):
         vp = ttk.PanedWindow(right, orient=tk.VERTICAL)
         vp.pack(fill=tk.BOTH, expand=True)
 
-        # --- image ------------------------------------------------------
+        # --- image + composition table ----------------------------------
         top = ttk.Frame(vp)
         vp.add(top, weight=3)
-        self.canvas = tk.Canvas(top, background="#2b2b2b", highlightthickness=0)
+        self.viewer = ttk.PanedWindow(top, orient=tk.HORIZONTAL)
+        self.viewer.pack(fill=tk.BOTH, expand=True)
+
+        image_side = ttk.Frame(self.viewer)
+        self.viewer.add(image_side, weight=3)
+        self.canvas = tk.Canvas(image_side, background="#2b2b2b", highlightthickness=0,
+                                width=520, height=300)
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.bind("<Configure>", self._resize_image)
+
+        # the table of compositions sits to the right of the photo; the sash
+        # can be dragged, and the paned window grows it with the window
+        self.table_side = ttk.Frame(self.viewer, width=420, padding=(6, 0, 6, 0))
+        self.table_side.pack_propagate(False)
+        self.viewer.add(self.table_side, weight=1)
+        self._build_table(self.table_side)
 
         # --- analyses + spectrum + info ---------------------------------
         bottom = ttk.Frame(vp)
@@ -187,7 +277,7 @@ class App(tk.Tk):
             state="readonly", width=19)
         self.spectrum_scale.current(0)
         self.spectrum_scale.pack(side=tk.LEFT, padx=6)
-        self.spectrum_scale.bind("<<ComboboxSelected>>", lambda e: self._redraw_spectrum())
+        self.spectrum_scale.bind("<<ComboboxSelected>>", self._on_scale_change)
         peak_controls = ttk.Frame(rf)
         peak_controls.pack(fill=tk.X)
         ttk.Label(peak_controls, text="Порог подписей").pack(side=tk.LEFT)
@@ -202,20 +292,34 @@ class App(tk.Tk):
                                      height=230, takefocus=True)
         self.spec_canvas.pack(fill=tk.BOTH, expand=True)
         self.spec_canvas.bind("<Configure>", lambda e: self._redraw_spectrum())
-        # zoom / pan: keys +-, arrows, mouse wheel and dragging
+        # zoom / pan: keys +-, arrows, mouse wheel (Ctrl -- the other axis)
+        # and dragging, which pans both axes at once
         self.spec_canvas.bind("<Button-1>", self._spec_press)
         self.spec_canvas.bind("<B1-Motion>", self._spec_drag)
         self.spec_canvas.bind("<ButtonRelease-1>", self._spec_release)
         self.spec_canvas.bind("<Double-Button-1>", lambda e: self._spec_reset())
         self.spec_canvas.bind("<MouseWheel>", self._spec_wheel)
+        self.spec_canvas.bind("<Control-MouseWheel>", self._spec_wheel_y)
+        if sys.platform == "darwin":
+            # a Control-scroll is a system gesture on macOS
+            self.spec_canvas.bind("<Command-MouseWheel>", self._spec_wheel_y)
         self.spec_canvas.bind("<Button-4>", lambda e: self._spec_zoom(1.25, e.x))
         self.spec_canvas.bind("<Button-5>", lambda e: self._spec_zoom(0.8, e.x))
+        self.spec_canvas.bind("<Control-Button-4>", lambda e: self._y_zoom(1.25, e.y))
+        self.spec_canvas.bind("<Control-Button-5>", lambda e: self._y_zoom(0.8, e.y))
         for seq in ("<plus>", "<equal>", "<KP_Add>"):
             self.spec_canvas.bind(seq, lambda e: self._spec_zoom(1.25))
         for seq in ("<minus>", "<KP_Subtract>"):
             self.spec_canvas.bind(seq, lambda e: self._spec_zoom(0.8))
+        for seq, factor in (("<Control-plus>", 1.25), ("<Control-equal>", 1.25),
+                            ("<Control-KP_Add>", 1.25), ("<Control-minus>", 0.8),
+                            ("<Control-KP_Subtract>", 0.8),
+                            ("<Shift-Up>", 1.25), ("<Shift-Down>", 0.8)):
+            self.spec_canvas.bind(seq, lambda e, f=factor: self._y_zoom(f))
         for seq, frac in (("<Left>", -0.12), ("<Right>", 0.12)):
             self.spec_canvas.bind(seq, lambda e, f=frac: self._spec_pan(f))
+        for seq, frac in (("<Up>", 0.12), ("<Down>", -0.12)):
+            self.spec_canvas.bind(seq, lambda e, f=frac: self._y_pan(f))
         self.spec_canvas.bind("<Home>", lambda e: self._spec_reset())
         self.info = tk.Text(rf, height=7, wrap="word", font=("Consolas", 9),
                             background="#f7f7f7")
@@ -233,6 +337,208 @@ class App(tk.Tk):
         self.logbox.configure(yscrollcommand=sb.set)
         self.logbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+    # ------------------------------------------------------- composition table
+    def _build_table(self, parent):
+        """A row per analysis of the site, a column per component, and
+        scrollbars in both directions: the oxide set is wider than any window
+        and a site can hold dozens of analyses."""
+        head = ttk.Frame(parent)
+        head.pack(fill=tk.X)
+        ttk.Label(head, text="Составы участка, мас. %").pack(side=tk.LEFT)
+        self.table_note = tk.StringVar(value="")
+        ttk.Label(head, textvariable=self.table_note,
+                  foreground="#666666").pack(side=tk.RIGHT)
+
+        style = ttk.Style(self)
+        style.configure("Comp.Treeview", rowheight=21, font=(UI_FONT, 9))
+        style.configure("Comp.Treeview.Heading", font=(UI_FONT, 9))
+        # the analysis chosen in the list stays yellow even when the table
+        # itself does not have the keyboard focus
+        style.map("Comp.Treeview",
+                  background=[("selected", "#ffe9a8")],
+                  foreground=[("selected", "#101418")])
+
+        grid = ttk.Frame(parent)
+        grid.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
+        self.table = ttk.Treeview(grid, show="headings", selectmode="browse",
+                                  style="Comp.Treeview")
+        ysb = ttk.Scrollbar(grid, orient=tk.VERTICAL, command=self.table.yview)
+        xsb = ttk.Scrollbar(grid, orient=tk.HORIZONTAL, command=self.table.xview)
+        self.table.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self.table.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        grid.rowconfigure(0, weight=1)
+        grid.columnconfigure(0, weight=1)
+        self.table.bind("<<TreeviewSelect>>", self._on_table_select)
+        self.table.bind("<Shift-MouseWheel>", self._table_wheel)
+        self.table.tag_configure("failed", foreground="#b03a2e")
+        self._fill_table([])
+
+    def _table_wheel(self, event):
+        """Shift+wheel scrolls the wide table sideways."""
+        delta = getattr(event, "delta", 0)
+        if delta:
+            self.table.xview_scroll(-2 if delta > 0 else 2, "units")
+        return "break"
+
+    def _refresh_table(self):
+        """Rebuild the table of the current site, keeping its selected row."""
+        if not self.current_fov:
+            self._rows = []
+            self._fill_table([])
+            return
+        self._rows = [self._quantify_row(n, sp)
+                      for n, sp in enumerate(self.current_fov.spectra, 1)]
+        self._fill_table(self._rows)
+        picked = self._selected_spectrum()
+        if picked:
+            self._select_table_row(picked[0])
+
+    def _fill_table(self, rows):
+        cols = self._table_columns(rows)
+        ids = tuple("c%d" % i for i in range(len(cols)))
+        self.table.configure(columns=ids)
+        for cid, (kind, key, head, width, anchor) in zip(ids, cols):
+            self.table.heading(cid, text=head)
+            self.table.column(cid, width=width, minwidth=26,
+                              anchor=anchor, stretch=False)
+        self.table.delete(*self.table.get_children())
+        for row in rows:
+            self.table.insert("", "end", iid=str(row["n"]),
+                              values=self._table_values(row, cols),
+                              tags=("failed",) if row.get("failed") else ())
+        self.table.xview_moveto(0)
+        if not rows:
+            self.table_note.set("нет анализов" if self.current_fov
+                                else "выберите участок")
+            return
+        note = "%d ан." % len(rows)
+        failed = sum(1 for row in rows if row.get("failed"))
+        errors = sum(1 for row in rows if row.get("error"))
+        if failed - errors:
+            note += " · неудачных: %d" % (failed - errors)
+        if errors:
+            note += " · без расчёта: %d" % errors
+        self.table_note.set(note)
+
+    def _table_columns(self, rows):
+        """(kind, key, heading, width, anchor) of every column to show.
+
+        Only the components that really occur at this site become columns: a
+        complete seventeen-oxide sheet would be mostly empty on an olivine and
+        force a horizontal scroll for nothing.  C, F and Cl have no conventional
+        oxide and are shown as elements; O is not shown because it is already
+        part of every oxide.
+        """
+        measured = [row for row in rows if row.get("comp")]
+        oxides = [name for name in analysis.OXIDE_ORDER
+                  if any((row.get("ox") or {}).get(name, 0.0) * 100 >= 0.005
+                         for row in measured)]
+        elements = [sym for sym, info in analysis.EL.items()
+                    if info[2] is None and sym != "O"
+                    and any((row.get("comp") or {}).get(sym, 0.0) * 100 >= 0.005
+                            for row in measured)]
+        cols = [("n", "n", "#", 32, "center"),
+                ("id", "id", "спектр", 128, "w")]
+        cols += [("ox", name, name, 58, "e") for name in oxides]
+        cols += [("el", sym, "%s эл." % sym, 54, "e") for sym in elements]
+        return cols
+
+    def _table_values(self, row, cols):
+        values = []
+        for kind, key, _head, _width, _anchor in cols:
+            if kind == "n":
+                values.append(str(row["n"]))
+            elif kind == "id":
+                values.append(row["id"])
+            elif row.get("failed"):
+                values.append("—")
+            elif kind == "ox":
+                value = (row.get("ox") or {}).get(key, 0.0) * 100.0
+                values.append("%.2f" % value if value >= 0.005 else "")
+            else:
+                value = (row.get("comp") or {}).get(key, 0.0) * 100.0
+                values.append("%.2f" % value if value >= 0.005 else "")
+        return values
+
+    def _select_table_row(self, n):
+        iid = str(n)
+        if not self.table.exists(iid):
+            return
+        if tuple(self.table.selection()) == (iid,):
+            return
+        self.table.selection_set(iid)
+        self.table.focus(iid)
+        self.table.see(iid)
+
+    def _on_table_select(self, _evt=None):
+        """A click (or an arrow key) in the table selects that analysis."""
+        if not self.current_fov:
+            return
+        picked = self.table.selection()
+        if not picked:
+            return
+        try:
+            n = int(picked[0])
+        except ValueError:
+            return
+        if not (1 <= n <= len(self.current_fov.spectra)):
+            return
+        if self.lst.curselection() == (n - 1,):
+            return
+        self.lst.selection_clear(0, tk.END)
+        self.lst.selection_set(n - 1)
+        self.lst.see(n - 1)
+        self.on_analysis_select()
+
+    def _row_for(self, n):
+        if 0 < n <= len(self._rows):
+            row = self._rows[n - 1]
+            if row.get("n") == n:
+                return row
+        return None
+
+    def _quantify_row(self, n, sp):
+        """One analysis as a table row, cached by the settings that matter.
+
+        The table needs every analysis of the site, so the same spectrum is
+        quantified again after a site, profile, μ/ρ or correction change; the
+        cache keeps a second visit free and stops the info panel from repeating
+        the work for the selected row.
+        """
+        row = {"n": n, "id": sp.id, "spectrum": sp}
+        try:
+            std = self._standards()
+            key = (tuple(sp.path), self._std_key, bool(Q.absorption_enabled()),
+                   Q.mac_file())
+        except Exception as e:
+            row["failed"] = True
+            row["error"] = "нет данных для расчёта: %s" % e
+            return row
+        cached = self._row_cache.get(key)
+        if cached is not None:
+            row.update(cached)
+            return row
+        try:
+            counts = sp.counts()
+            if analysis.is_failed(counts):
+                row["failed"] = True
+                row["reason"] = "неудачная съёмка (нет пиков выше нуль-пика)"
+            else:
+                comp, ox, details = analysis.quantify_spectrum(sp, std)
+                if not ox and set(comp) <= {"O"}:
+                    row["failed"] = True
+                    row["reason"] = "пиков выше порога нет"
+                else:
+                    row.update(comp=comp, ox=ox, details=details)
+        except Exception as e:
+            row["failed"] = True
+            row["error"] = str(e)
+        self._row_cache[key] = {k: v for k, v in row.items()
+                                if k not in ("n", "id", "spectrum")}
+        return row
 
     # ---------------------------------------------------------------- log
     def log(self, msg):
@@ -302,10 +608,12 @@ class App(tk.Tk):
         Q.reset_cache()
         self._std = None
         self._std_key = None
+        self._row_cache.clear()
         self._refresh_mac_sets()
         self.log("Калибровка: %s (%s)" % (p.title, p.slug))
         if serial:
             self.log("  выбор запомнен для детектора S/N %s" % serial)
+        self._refresh_table()
         if self.lst.curselection():
             self.on_analysis_select()
 
@@ -331,14 +639,18 @@ class App(tk.Tk):
         s = self._mac_sets[i]
         Q.set_active_mac_set(s.slug)
         Q.reset_cache()
+        self._row_cache.clear()
         self.log("Коэффициенты поглощения: %s (%s)" % (s.title, os.path.basename(s.path)))
+        self._refresh_table()
         if self.lst.curselection():
             self.on_analysis_select()
 
     def on_absorption_change(self):
         on = bool(self.absorb_var.get())
         Q.set_absorption_enabled(on)
+        self._row_cache.clear()
         self.log("Поправка на поглощение: %s" % ("включена" if on else "выключена"))
+        self._refresh_table()
         if self.lst.curselection():
             self.on_analysis_select()
 
@@ -413,8 +725,11 @@ class App(tk.Tk):
         self.placed, self.lines = [], []
         self.current_fov = None
         self._spec = None
+        self._rows = []
+        self._row_cache.clear()
         self._show_image()
         self.lst.delete(0, tk.END)
+        self._fill_table([])
         self.info.configure(state=tk.NORMAL)
         self.info.delete("1.0", tk.END)
         self.info.configure(state=tk.DISABLED)
@@ -489,9 +804,17 @@ class App(tk.Tk):
                 self.lines.append((label, xy))
             elif xy:
                 self.placed.append((xy[0][0], xy[0][1], label, sid))
+        self._refresh_table()
         if self.current_fov.spectra:
             self.lst.selection_set(0)
             self.on_analysis_select()
+        else:
+            # a site without spectra must not leave the previous one on screen
+            self._spec = None
+            self._redraw_spectrum()
+            self.info.configure(state=tk.NORMAL)
+            self.info.delete("1.0", tk.END)
+            self.info.configure(state=tk.DISABLED)
         if source == "project":
             self.log("Координаты площадок прочитаны из проекта (ChordList): %d точек"
                      % sum(len(xy) for _l, _s, xy in positions))
@@ -532,6 +855,10 @@ class App(tk.Tk):
                            max(1, int(img.height * self._scale))))
         from PIL import ImageTk
         self._img_ref = ImageTk.PhotoImage(disp)
+        # centre the photo in its pane: the table takes the rest of the room
+        # and a left-aligned image would leave one wide empty strip
+        self._img_origin = (max(0, (self.canvas.winfo_width() - disp.width) // 2),
+                            max(0, (self.canvas.winfo_height() - disp.height) // 2))
         selected = self._selected_spectrum()
         if selected:
             self._highlight(selected[0])
@@ -545,11 +872,12 @@ class App(tk.Tk):
         self.canvas.delete("all")
         if self._img_ref is None:
             return
-        self.canvas.create_image(0, 0, anchor="nw", image=self._img_ref)
+        ox, oy = getattr(self, "_img_origin", (0, 0))
+        self.canvas.create_image(ox, oy, anchor="nw", image=self._img_ref)
         s = self._scale
         for (lbl, xy) in self.lines:
-            xs = [x * s for x, y in xy]
-            ys = [y * s for x, y in xy]
+            xs = [x * s + ox for x, y in xy]
+            ys = [y * s + oy for x, y in xy]
             x0, x1 = min(xs), max(xs)
             y0, y1 = min(ys), max(ys)
             if x1 - x0 < 11:
@@ -563,7 +891,7 @@ class App(tk.Tk):
             self.canvas.create_text(x1 + 6, (y0 + y1) / 2, text=str(lbl), anchor="w",
                                     fill="#ff3030", font=("Arial", 11, "bold"))
         for (x, y, lbl, _sid) in self.placed:
-            px, py = x * s, y * s
+            px, py = x * s + ox, y * s + oy
             radius = render.POINT_RADIUS
             self.canvas.create_oval(px - radius, py - radius, px + radius, py + radius,
                                     outline="#ff3030", width=2)
@@ -579,7 +907,8 @@ class App(tk.Tk):
         if bar is None:
             return
         pixels, text = bar
-        x, y = 8, height - 7
+        ox, oy = getattr(self, "_img_origin", (0, 0))
+        x, y = ox + 8, oy + height - 7
         label = self.canvas.create_text(x, y - 5, text=text, anchor="sw",
                                         fill="white", font=("Arial", 11))
         _, top, right, _ = self.canvas.bbox(label)
@@ -625,23 +954,25 @@ class App(tk.Tk):
         n, sp = picked
         self._draw_spectrum(sp)
         self._show_info(n, sp)
-        # highlight the matching area on the image
+        # the same analysis is highlighted in the table and on the image
+        self._select_table_row(n)
         self._highlight(n)
 
     def _highlight(self, n):
         self._redraw_markers()
         s = self._scale
+        ox, oy = getattr(self, "_img_origin", (0, 0))
         for (lbl, xy) in self.lines:
             if str(lbl) != str(n):
                 continue
-            xs = [x * s for x, y in xy]
-            ys = [y * s for x, y in xy]
+            xs = [x * s + ox for x, y in xy]
+            ys = [y * s + oy for x, y in xy]
             self.canvas.create_rectangle(min(xs) - 3, min(ys) - 3,
                                          max(xs) + 3, max(ys) + 3,
                                          outline="#ffe14d", width=2)
         for (x, y, lbl, _sid) in self.placed:
             if str(lbl) == str(n):
-                px, py = x * s, y * s
+                px, py = x * s + ox, y * s + oy
                 radius = render.POINT_RADIUS + 3
                 self.canvas.create_oval(px - radius, py - radius, px + radius, py + radius,
                                         outline="#ffe14d", width=2)
@@ -653,9 +984,10 @@ class App(tk.Tk):
     def _draw_spectrum(self, sp):
         self._spec = (sp.counts(), [l for l in sp.labels() if 0 < l[2] < 21000])
         self._view = None                 # a new spectrum starts at full range
+        self._yview = None
         self._redraw_spectrum()
 
-    # ---- spectrum view: zoom and pan ---------------------------------------
+    # ---- spectrum view: horizontal zoom and pan ----------------------------
     def _spec_limits(self):
         data = getattr(self, "_spec", None)
         if not data or len(data[0]) < 2:
@@ -670,7 +1002,7 @@ class App(tk.Tk):
         lo, hi = self._view or limits
         return max(limits[0], lo), min(limits[1], hi)
 
-    def _set_view(self, lo, hi):
+    def _set_view(self, lo, hi, redraw=True):
         limits = self._spec_limits()
         if not limits:
             return
@@ -686,10 +1018,96 @@ class App(tk.Tk):
             self._view = None
         else:
             self._view = (lo, hi)
+        if redraw:
+            self._redraw_spectrum()
+
+    # ---- spectrum view: vertical zoom and pan ------------------------------
+    def _log_scale(self):
+        return self.spectrum_scale.current() == 0
+
+    def _to_disp(self, counts):
+        """counts -> position on the intensity axis of the chosen scale"""
+        return math.log10(counts + 1.0) if self._log_scale() else float(counts)
+
+    def _y_limits(self):
+        """the whole intensity axis as (lo, hi) in display units"""
+        data = getattr(self, "_spec", None)
+        if not data or len(data[0]) < 2:
+            return None
+        return 0.0, self._to_disp(max(max(data[0]), 1))
+
+    def _current_y_view(self):
+        limits = self._y_limits()
+        if not limits:
+            return None
+        lo, hi = self._yview or limits
+        return max(limits[0], lo), min(limits[1], hi)
+
+    def _set_y_view(self, lo, hi, redraw=True):
+        limits = self._y_limits()
+        if not limits:
+            return
+        full = limits[1] - limits[0]
+        span = max(hi - lo, full / 400.0)      # stop at 1/400 of the full height
+        centre = (lo + hi) / 2.0
+        lo, hi = centre - span / 2.0, centre + span / 2.0
+        lo = max(limits[0], min(lo, limits[1] - span))
+        self._yview = None if span >= full else (lo, lo + span)
+        if redraw:
+            self._redraw_spectrum()
+
+    def _on_scale_change(self, _evt=None):
+        """log and linear measure the axis in different units, so the old
+        vertical range means nothing: start again from the whole axis"""
+        self._yview = None
         self._redraw_spectrum()
+
+    def _y_ticks(self, lo, hi, logarithmic):
+        """counts to label on the visible part of the intensity axis; the grid
+        follows the view, so zooming in shows a finer scale"""
+        span = max(hi - lo, 1e-12)
+        if not logarithmic:
+            target = span / 5.0
+            decade = 10.0 ** math.floor(math.log10(target))
+            step = next(s * decade for s in (1, 2, 5, 10) if s * decade >= target)
+            ticks, value = [], math.ceil(lo / step - 1e-9) * step
+            while value <= hi + step * 1e-9 and len(ticks) < 12:
+                ticks.append(value)
+                value += step
+            return ticks
+        # logarithmic: a grid line per decade while at least two are visible,
+        # then 1, 2, 3, 5, 7 in the decades the window covers, then anything
+        first = max(0, int(math.floor(lo)) - 1)
+        last = int(math.floor(hi)) + 1
+        decades = [10.0 ** k for k in range(first, last + 1)
+                   if lo - 1e-9 <= self._to_disp(10.0 ** k) <= hi + 1e-9]
+        if len(decades) >= 2:
+            return decades
+        ticks = [m * 10.0 ** k
+                 for k in range(first, last + 1)
+                 for m in (1.0, 2.0, 3.0, 5.0, 7.0)
+                 if lo - 1e-9 <= self._to_disp(m * 10.0 ** k) <= hi + 1e-9]
+        if len(ticks) >= 2:
+            return sorted(ticks)
+        return [10.0 ** (lo + span * i / 4.0) - 1.0 for i in range(5)]
+
+    def _axis_margin(self, ticks):
+        """left margin of the plot, wide enough for the widest intensity label:
+        a five-digit number must not be cut by the edge of the canvas"""
+        c = self.spec_canvas
+        text = max((_fmt_counts(t) for t in ticks), key=len, default="")
+        if not text:
+            return 52
+        probe = c.create_text(0, 0, text=text, font=(UI_FONT, 8))
+        box = c.bbox(probe)
+        c.delete(probe)
+        if not box:
+            return 52
+        return min(max(52, box[2] - box[0] + 14), max(52, c.winfo_width() // 3))
 
     def _spec_reset(self):
         self._view = None
+        self._yview = None
         self._redraw_spectrum()
 
     def _spec_zoom(self, factor, x=None):
@@ -701,7 +1119,7 @@ class App(tk.Tk):
             anchor = (lo + hi) / 2.0
         else:
             c = self.spec_canvas
-            L, R = 52, 14
+            L, R = self._spec_left, 14
             w = max(c.winfo_width(), 200)
             frac = min(1.0, max(0.0, (x - L) / max(1.0, (w - R - L))))
             anchor = lo + frac * (hi - lo)
@@ -716,6 +1134,30 @@ class App(tk.Tk):
         shift = (hi - lo) * fraction
         self._set_view(lo + shift, hi + shift)
 
+    def _y_zoom(self, factor, y=None):
+        view = self._current_y_view()
+        if not view:
+            return
+        lo, hi = view
+        if y is None:
+            anchor = (lo + hi) / 2.0
+        else:
+            c = self.spec_canvas
+            T, B = 20, 30
+            h = max(c.winfo_height(), 120)
+            frac = min(1.0, max(0.0, (y - T) / max(1.0, (h - B - T))))
+            anchor = hi - frac * (hi - lo)     # the axis grows downwards
+        self._set_y_view(anchor - (anchor - lo) / factor,
+                         anchor + (hi - anchor) / factor)
+
+    def _y_pan(self, fraction):
+        view = self._current_y_view()
+        if not view:
+            return
+        lo, hi = view
+        shift = (hi - lo) * fraction
+        self._set_y_view(lo + shift, hi + shift)
+
     def _spec_wheel(self, event):
         self.spec_canvas.focus_set()
         delta = getattr(event, "delta", 0)
@@ -723,22 +1165,38 @@ class App(tk.Tk):
             return
         self._spec_zoom(1.25 if delta > 0 else 0.8, event.x)
 
+    def _spec_wheel_y(self, event):
+        self.spec_canvas.focus_set()
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            return
+        self._y_zoom(1.25 if delta > 0 else 0.8, event.y)
+
     def _spec_press(self, event):
         self.spec_canvas.focus_set()
         view = self._current_view()
-        if not view:
+        yview = self._current_y_view()
+        if not view or not yview:
             return
-        self._drag = (event.x, view)
+        self._drag = (event.x, event.y, view, yview)
 
     def _spec_drag(self, event):
+        """drag pans both axes: the curve stays under the cursor"""
         if not getattr(self, "_drag", None):
             return
-        x0, (lo, hi) = self._drag
+        x_press, y_press, (lo, hi), (y_lo, y_hi) = self._drag
         c = self.spec_canvas
-        L, R = 52, 14
+        L, R, T, B = self._spec_left, 14, 20, 30
         width = max(1.0, max(c.winfo_width(), 200) - R - L)
-        shift = -(event.x - x0) / width * (hi - lo)
-        self._set_view(lo + shift, hi + shift)
+        height = max(1.0, max(c.winfo_height(), 120) - B - T)
+        shift = -(event.x - x_press) / width * (hi - lo)
+        self._set_view(lo + shift, hi + shift, redraw=False)
+        # with the whole intensity axis on screen there is nothing to pan there,
+        # and a slightly crooked drag must stay a pure horizontal scroll
+        if self._yview is not None:
+            y_shift = (event.y - y_press) / height * (y_hi - y_lo)
+            self._set_y_view(y_lo + y_shift, y_hi + y_shift, redraw=False)
+        self._redraw_spectrum()
 
     def _spec_release(self, _event=None):
         self._drag = None
@@ -757,35 +1215,30 @@ class App(tk.Tk):
         n = len(counts)
         if n < 2:
             return
-        L, R, T, B = 52, 14, 20, 30
-        x0, x1, y0, y1 = L, w - R, T, h - B
-        if x1 - x0 < 40 or y1 - y0 < 30:
-            return
         top = max(max(counts), 1)
-        logarithmic = self.spectrum_scale.current() == 0
-        if logarithmic:
-            ymax = math.log10(top + 1)
-            ticks = [10 ** exp for exp in range(math.floor(math.log10(top)) + 1)]
-        else:
-            target = max(1, top / 5)
-            decade = 10 ** math.floor(math.log10(target))
-            tick_step = next(step * decade for step in (1, 2, 5, 10)
-                             if step * decade >= target)
-            ymax = math.ceil(top / tick_step) * tick_step
-            ticks = range(0, ymax + 1, tick_step)
-
+        logarithmic = self._log_scale()
         view = self._current_view()
-        if not view:
+        yview = self._current_y_view()
+        if not view or not yview:
             return
         e_lo, e_hi = view
         span = e_hi - e_lo
+        y_lo, y_hi = yview
+        y_span = y_hi - y_lo
+        if span <= 0 or y_span <= 0:
+            return
+        ticks = self._y_ticks(y_lo, y_hi, logarithmic)
+        L, R, T, B = self._axis_margin(ticks), 14, 20, 30
+        self._spec_left = L
+        x0, x1, y0, y1 = L, w - R, T, h - B
+        if x1 - x0 < 40 or y1 - y0 < 30:
+            return
 
         def X(e_kev):
             return x0 + (x1 - x0) * (e_kev - e_lo) / span
 
         def Y(v):
-            value = math.log10(v + 1) if logarithmic else v
-            return y1 - (y1 - y0) * (value / ymax)
+            return y1 - (y1 - y0) * (self._to_disp(v) - y_lo) / y_span
 
         def E_of_ch(ch):
             return I.to_energy(ch) / 1000.0
@@ -793,8 +1246,10 @@ class App(tk.Tk):
         # grid
         for tick in ticks:
             y = Y(tick)
+            if not (y0 - 0.5 <= y <= y1 + 0.5):
+                continue
             c.create_line(x0, y, x1, y, fill="#243040")
-            c.create_text(x0 - 6, y, text="%d" % tick, anchor="e",
+            c.create_text(x0 - 6, y, text=_fmt_counts(tick), anchor="e",
                           fill=AXIS, font=(UI_FONT, 8))
         step = next((s for s in (0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0)
                      if span / s <= 12), 10.0)
@@ -829,8 +1284,17 @@ class App(tk.Tk):
             ch = a + seg.index(v)
             pts.extend((X(E_of_ch(ch)), Y(v)))
             i += 1
+        drawn = 0
         if len(pts) > 3:
-            c.create_line(*pts, fill="#7fd4ff", width=1, tags=("spectrum_curve",))
+            for run in _runs_inside(pts, y0, y1):
+                c.create_line(*run, fill="#7fd4ff", width=1,
+                              tags=("spectrum_curve",))
+                drawn += 1
+        if not drawn:
+            c.create_text((x0 + x1) / 2.0, (y0 + y1) / 2.0, fill=AXIS,
+                          font=(UI_FONT, 9),
+                          text="спектр целиком выше этого окна "
+                               "интенсивности — ↑↓ или Home")
 
         # Keep each saved line at its own energy; only those inside the view.
         visible = []
@@ -844,7 +1308,9 @@ class App(tk.Tk):
                 continue
             lo, hi = max(0, ch - 6), min(n, ch + 7)
             v = max(counts[lo:hi])
-            if v < threshold:
+            # a peak outside the zoomed intensity window is not on the screen:
+            # its label would sit on a border instead of on the peak
+            if v < threshold or not (y_lo <= self._to_disp(v) <= y_hi):
                 continue
             background = (counts[max(0, ch - 12)] + counts[min(n - 1, ch + 12)]) / 2
             visible.append((v - background, v, energy, name))
@@ -854,7 +1320,8 @@ class App(tk.Tk):
             label_y = max(y0 + 8, Y(v) - 8)
             label_y = min(y1 - 8, label_y)
             marker = c.create_line(x, y0, x, y1, fill="#5a4630")
-            c.tag_lower(marker, "spectrum_curve")
+            if c.find_withtag("spectrum_curve"):
+                c.tag_lower(marker, "spectrum_curve")
             label = c.create_text(x, label_y, text=name, fill="#ffcf70",
                                   font=(UI_FONT, 9, "bold"))
             left, _, right, _ = c.bbox(label)
@@ -873,10 +1340,24 @@ class App(tk.Tk):
                     break
             c.addtag_withtag("peak_label", label)
 
-        hint = "колесо / +- масштаб, ←→ сдвиг, двойной щелчок — весь спектр"
-        c.create_text(x0, 6, anchor="w", fill=AXIS, font=(UI_FONT, 8),
-                      text="%d каналов · %.2f–%.2f кэВ · %s"
-                      % (n, e_lo, e_hi, hint))
+        # the header is cut on a narrow window, so the longest line that fits
+        # is the one that is kept: first the range with the key hint, then the
+        # range alone, and on a really small canvas only the energies
+        head = "%d каналов · %.2f–%.2f кэВ" % (n, e_lo, e_hi)
+        hints = ("колесо — масштаб X, Ctrl+колесо — масштаб Y, ←→↑↓ — сдвиг, "
+                 "2× — сброс",
+                 "колесо — X, Ctrl+колесо — Y, стрелки — сдвиг, 2× — сброс",
+                 "колесо — X, Ctrl+колесо — Y, стрелки — сдвиг",
+                 "Ctrl+колесо — масштаб Y")
+        lines = [head + " · " + hint for hint in hints]
+        lines.append(head)
+        lines.append("%.2f–%.2f кэВ" % (e_lo, e_hi))
+        for text in lines:
+            item = c.create_text(x0, 6, anchor="w", fill=AXIS,
+                                 font=(UI_FONT, 8), text=text)
+            if c.bbox(item)[2] <= x1:
+                break
+            c.delete(item)
 
     def _show_info(self, n, sp):
         em = sp.em_conditions()
@@ -905,46 +1386,46 @@ class App(tk.Tk):
         if labels:
             lines.append("Метки INCA: " + ", ".join("%s %.3f кэВ" % (name, ev / 1000)
                                                    for _, name, ev in labels))
-        if analysis.is_failed(counts):
-            lines.append("Расчёт: неудачная съёмка (нет пиков выше нуль-пика)")
+        row = self._row_for(n)
+        if row is None:
+            row = self._quantify_row(n, sp)
+        if row.get("error"):
+            lines.append("Расчёт недоступен: %s" % row["error"])
+        elif row.get("failed"):
+            lines.append("Расчёт: %s" % (row.get("reason") or "неудачная съёмка"))
         else:
-            try:
-                std = self._standards()
-                if not std:
-                    lines.append("Расчёт: нет калибровочных данных")
+            comp, ox, details = row["comp"], row["ox"], row["details"]
+            # exactly the elements of the spectrum, in their own order:
+            # an element is either a number here or explicitly explained
+            parts, rest = [], []
+            for sym in details["quantified"]:
+                name = analysis.EL[sym][2]
+                if not name:
+                    continue          # C, F, Cl: shown below as elements
+                value = ox.get(name, 0.0) * 100
+                if value >= 0.005:
+                    parts.append("%s %.2f" % (name, value))
                 else:
-                    comp, ox, details = analysis.quantify_spectrum(sp, std)
-                    # exactly the elements of the spectrum, in their own order:
-                    # an element is either a number here or explicitly explained
-                    parts, rest = [], []
-                    for sym in details["quantified"]:
-                        name = analysis.EL[sym][2]
-                        if not name:
-                            continue          # C, O, F, Cl: shown below as elements
-                        value = ox.get(name, 0.0) * 100
-                        if value >= 0.005:
-                            parts.append("%s %.2f" % (name, value))
-                        else:
-                            rest.append("%s <0.01" % name)
-                    if parts:
-                        lines.append("Состав, мас.%: " + "   ".join(parts))
-                        total = sum(ox.values()) * 100 if ox else 0.0
-                        lines.append("Сумма оксидов: %.2f" % total)
-                    else:
-                        lines.append("Состав: пиков выше порога нет")
-                    if rest:
-                        lines.append("Ниже 0.01: " + ", ".join(rest))
-                    no_ox = [s for s in details["no_oxide"]
-                             if comp.get(s, 0) * 100 >= 0.005]
-                    if no_ox:
-                        lines.append("Без оксида (элемент): "
-                                     + ", ".join("%s %.2f" % (s, comp[s] * 100)
-                                                 for s in no_ox))
-                    if details["no_standard"]:
-                        lines.append("Нет стандарта в этой калибровке: "
-                                     + ", ".join(details["no_standard"]))
-            except Exception as e:
-                lines.append("Расчёт недоступен: %s" % e)
+                    rest.append("%s <0.01" % name)
+            if parts:
+                lines.append("Состав, мас.%: " + "   ".join(parts))
+                total = sum(ox.values()) * 100 if ox else 0.0
+                lines.append("Сумма оксидов: %.2f" % total)
+            else:
+                lines.append("Состав: пиков выше порога нет")
+            if rest:
+                lines.append("Ниже 0.01: " + ", ".join(rest))
+            # oxygen is not a component of its own: it is already inside every
+            # oxide, and the table does not show it either
+            no_ox = [s for s in details["no_oxide"]
+                     if s != "O" and comp.get(s, 0) * 100 >= 0.005]
+            if no_ox:
+                lines.append("Без оксида (элемент): "
+                             + ", ".join("%s %.2f" % (s, comp[s] * 100)
+                                         for s in no_ox))
+            if details["no_standard"]:
+                lines.append("Нет стандарта в этой калибровке: "
+                             + ", ".join(details["no_standard"]))
         lines.append("μ/ρ: %s; поправка на поглощение %s"
                      % (Q.mac_title(),
                         "включена" if Q.absorption_enabled() else "выключена"))
